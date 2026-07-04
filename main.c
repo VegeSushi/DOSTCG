@@ -12,137 +12,350 @@ extern void draw_rect(int x, int y, int w, int h, unsigned char color);
 extern void draw_ui_box(void);
 extern void print_text(int row, int col, const char* str, unsigned char color);
 
-void clear_ui_text(void) { 
-    draw_rect(2, 142, 316, 56, 1); 
+#define MAX_TEAM 4
+#define MAX_ROSTER 20
+#define MAX_VISIBLE 15
+
+/* Translated key codes (kept well outside char/ASCII range) */
+#define KEY_UP    1000
+#define KEY_DOWN  1001
+#define KEY_LEFT  1002
+#define KEY_RIGHT 1003
+#define KEY_ENTER 0x0D
+#define KEY_ESC   0x1B
+
+typedef struct {
+    Character members[MAX_TEAM];
+    int count;
+    int active; /* index into members[], -1 if none alive/none set */
+} Team;
+
+void clear_ui_text(void) {
+    draw_rect(2, 142, 316, 56, 1);
 }
 
-// --- FILE IO ---
+/* --- INPUT HANDLING ---
+   IMPORTANT: the caller must store the return value in an int,
+   NOT a char, because KEY_UP/DOWN/LEFT/RIGHT fall outside char range.
+   Extended keys (arrows, function keys) are reported by getch() as
+   a 0 (or 0xE0 on some BIOSes) followed by a scan code byte. */
+int read_key(void) {
+    int c;
+    c = getch();
+    if (c == 0 || c == 0xE0) {
+        c = getch();
+        switch (c) {
+            case 72: return KEY_UP;
+            case 80: return KEY_DOWN;
+            case 75: return KEY_LEFT;
+            case 77: return KEY_RIGHT;
+            default: return 0;
+        }
+    }
+    return c;
+}
+
+/* --- FILE IO --- */
 int load_character(const char* filename, Character* target) {
     FILE *f;
-    ArchiveHeader header; 
-    ArchiveEntry entry; 
+    ArchiveHeader header;
+    ArchiveEntry entry;
     int i;
-    unsigned char temp_byte; // Safe buffer to prevent pointer truncation!
-    
+    unsigned char temp_byte; /* Safe buffer to prevent pointer truncation! */
+
     f = fopen(filename, "rb");
-    if (!f) return 0; 
-    
+    if (!f) return 0;
+
     fread(&header, sizeof(ArchiveHeader), 1, f);
     if (strncmp(header.magic, "CHAR", 4) != 0) { fclose(f); return 0; }
-    
+
     fread(&entry, sizeof(ArchiveEntry), 1, f);
     fread(target->name, 16, 1, f);
     fread(&target->max_hp, 4, 1, f); fread(&target->hp, 4, 1, f);
     fread(&target->base_atk, 4, 1, f); fread(&target->base_def, 4, 1, f);
     fread(&target->pad1, 4, 1, f); fread(&target->pad2, 4, 1, f);
-    
-    for(i = 0; i < 4; i++) {
+
+    for (i = 0; i < 4; i++) {
         fread(target->moves[i].name, 16, 1, f);
         fread(&target->moves[i].type, 4, 1, f);
         fread(&target->moves[i].power, 4, 1, f);
     }
-    
-    // Use Watcom's _fmalloc to assign extended memory
+
+    /* Use Watcom's _fmalloc to assign extended (far) memory */
     target->sprite_data = (unsigned char far*)_fmalloc(4096);
     if (target->sprite_data) {
-        // Read into Near memory, then push to Far memory to prevent W112 truncation
-        for(i = 0; i < 4096; i++) {
+        /* Read into Near memory, then push to Far memory to prevent W112 truncation */
+        for (i = 0; i < 4096; i++) {
             fread(&temp_byte, 1, 1, f);
             target->sprite_data[i] = temp_byte;
         }
     }
-    
-    fclose(f); 
+
+    fclose(f);
     return 1;
 }
 
 int load_core_bg(int index, Background* bg) {
     FILE *f;
-    ArchiveHeader header; 
+    ArchiveHeader header;
     int i;
-    
+
     f = fopen("content\\core.pak", "rb");
-    if(!f) return 0;
-    
+    if (!f) return 0;
+
     fread(&header, sizeof(ArchiveHeader), 1, f);
-    for(i = 0; i < header.num_entries; i++) {
+    for (i = 0; i < header.num_entries; i++) {
         fread(bg->bg_name, 16, 1, f);
         fread(&bg->bg_color, 1, 1, f);
-        if(i == index) { fclose(f); return 1; }
+        if (i == index) { fclose(f); return 1; }
     }
-    fclose(f); 
+    fclose(f);
     return 0;
 }
 
-// --- BATTLE ---
-void battle_scene(Character* player, Character* enemy, Background* bg) {
-    char buffer[50]; 
-    int action = 1; 
-    char key;
-    
-    draw_rect(0, 0, 320, 140, bg->bg_color); 
-    if(player->sprite_data) draw_sprite(40, 60, player->sprite_data);
-    if(enemy->sprite_data) draw_sprite(210, 20, enemy->sprite_data);
-    draw_ui_box();
-    
-    while(player->hp > 0 && enemy->hp > 0) {
-        clear_ui_text();
-        sprintf(buffer, "%s HP:%ld", enemy->name, enemy->hp);
-        print_text(1, 1, buffer, 15); 
-        sprintf(buffer, "%s HP:%ld", player->name, player->hp);
-        print_text(15, 20, buffer, 15); 
-        
-        print_text(19, 2, "Action:", 14); 
-        print_text(21, 4, "1. Atk", action == 1 ? 15 : 7); 
-        print_text(22, 4, "2. Item", action == 2 ? 15 : 7);
-        
-        key = getch();
-        if(key == '1') action = 1; if(key == '2') action = 2;
-        
-        if(key == 0x0D) { 
-            clear_ui_text();
-            if(action == 1) {
-                sprintf(buffer, "%s uses %s!", player->name, player->moves[0].name);
-                print_text(20, 2, buffer, 15);
-                enemy->hp -= (player->base_atk + player->moves[0].power) - enemy->base_def;
-            }
-            print_text(22, 2, "Press Key...", 14); getch();
-            
-            if(enemy->hp > 0) {
-                clear_ui_text();
-                sprintf(buffer, "%s attacks!", enemy->name);
-                print_text(20, 2, buffer, 12); 
-                player->hp -= enemy->base_atk;
-                print_text(22, 2, "Press Key...", 14); getch();
+/* --- TEAM HELPERS --- */
+int team_alive_count(Team* t) {
+    int i, c;
+    c = 0;
+    for (i = 0; i < t->count; i++) if (t->members[i].hp > 0) c++;
+    return c;
+}
+
+int team_next_alive(Team* t, int start) {
+    int i;
+    for (i = start; i < t->count; i++) if (t->members[i].hp > 0) return i;
+    return -1;
+}
+
+/* --- TEAM SELECTION SCREEN (up to MAX_TEAM cards, arrow keys + numbers) --- */
+int select_team(char display_names[][16], int roster_count, int* chosen, const char* title) {
+    int cursor;
+    int count;
+    int done;
+    int key;
+    int i, j;
+    int found_idx;
+    int visible;
+    char buffer[48];
+
+    if (roster_count <= 0) return 0;
+
+    cursor = 0;
+    count = 0;
+    done = 0;
+    visible = (roster_count < MAX_VISIBLE) ? roster_count : MAX_VISIBLE;
+
+    for (i = 0; i < MAX_TEAM; i++) chosen[i] = -1;
+
+    while (!done) {
+        draw_rect(0, 0, 320, 200, 0);
+        print_text(1, 2, title, 14);
+        sprintf(buffer, "Selected: %d/%d", count, MAX_TEAM);
+        print_text(3, 2, buffer, 7);
+        print_text(4, 2, "Arrows/1-9: move  ENTER: toggle  ESC: back", 8);
+
+        for (i = 0; i < visible; i++) {
+            found_idx = -1;
+            for (j = 0; j < MAX_TEAM; j++) if (chosen[j] == i) found_idx = j;
+            sprintf(buffer, "%s %d. %s", (found_idx >= 0) ? "[X]" : "[ ]", i + 1, display_names[i]);
+            print_text(6 + i, 4, buffer, (cursor == i) ? 15 : ((found_idx >= 0) ? 10 : 7));
+        }
+        print_text(6 + visible, 4, "[ DONE ]", (cursor == visible) ? 15 : 12);
+
+        key = read_key();
+
+        if (key == KEY_UP) { cursor--; if (cursor < 0) cursor = visible; }
+        else if (key == KEY_DOWN) { cursor++; if (cursor > visible) cursor = 0; }
+        else if (key >= '1' && key <= '9') {
+            i = key - '1';
+            if (i < visible) cursor = i;
+        }
+        else if (key == KEY_ESC) {
+            done = 1; /* leave with whatever was chosen so far (may be 0) */
+        }
+        else if (key == KEY_ENTER) {
+            if (cursor == visible) {
+                if (count > 0) done = 1;
+            } else {
+                found_idx = -1;
+                for (j = 0; j < MAX_TEAM; j++) if (chosen[j] == cursor) found_idx = j;
+                if (found_idx >= 0) {
+                    /* remove & compact */
+                    for (i = found_idx; i < MAX_TEAM - 1; i++) chosen[i] = chosen[i + 1];
+                    chosen[MAX_TEAM - 1] = -1;
+                    count--;
+                } else if (count < MAX_TEAM) {
+                    chosen[count] = cursor;
+                    count++;
+                }
             }
         }
     }
-    
+    return count;
+}
+
+/* --- BATTLE-TIME "CHOOSE NEXT FIGHTER" SCREEN --- */
+int choose_next_character(Team* t, const char* label) {
+    int cursor;
+    int key;
+    int i;
+    int done;
+    int chosen;
+    char buffer[48];
+
+    cursor = 0;
+    for (i = 0; i < t->count; i++) { if (t->members[i].hp > 0) { cursor = i; break; } }
+
+    done = 0;
+    chosen = -1;
+    while (!done) {
+        draw_rect(0, 0, 320, 200, 0);
+        print_text(2, 2, label, 14);
+        print_text(4, 2, "Choose next fighter:", 15);
+
+        for (i = 0; i < t->count; i++) {
+            if (t->members[i].hp <= 0) {
+                sprintf(buffer, "%d. %s (FAINTED)", i + 1, t->members[i].name);
+                print_text(6 + i, 4, buffer, 8);
+            } else {
+                sprintf(buffer, "%d. %s HP:%ld", i + 1, t->members[i].name, t->members[i].hp);
+                print_text(6 + i, 4, buffer, (cursor == i) ? 15 : 7);
+            }
+        }
+
+        key = read_key();
+        if (key == KEY_UP) {
+            do { cursor--; if (cursor < 0) cursor = t->count - 1; } while (t->members[cursor].hp <= 0);
+        } else if (key == KEY_DOWN) {
+            do { cursor++; if (cursor >= t->count) cursor = 0; } while (t->members[cursor].hp <= 0);
+        } else if (key >= '1' && key <= '9') {
+            i = key - '1';
+            if (i < t->count && t->members[i].hp > 0) cursor = i;
+        } else if (key == KEY_ENTER) {
+            if (t->members[cursor].hp > 0) { chosen = cursor; done = 1; }
+        }
+    }
+    return chosen;
+}
+
+/* --- BATTLE --- */
+void draw_full_battle(Team* p1, Team* p2, Background* bg) {
+    draw_rect(0, 0, 320, 140, bg->bg_color);
+    if (p1->active >= 0 && p1->members[p1->active].sprite_data)
+        draw_sprite(40, 60, p1->members[p1->active].sprite_data);
+    if (p2->active >= 0 && p2->members[p2->active].sprite_data)
+        draw_sprite(210, 20, p2->members[p2->active].sprite_data);
+    draw_ui_box();
+}
+
+void battle_scene(Team* p1, Team* p2, Background* bg) {
+    char buffer[50];
+    int action;
+    int key;
+    Character* pc;
+    Character* ec;
+    int next_idx;
+
+    action = 1;
+    p1->active = team_next_alive(p1, 0);
+    p2->active = team_next_alive(p2, 0);
+
+    draw_full_battle(p1, p2, bg);
+
+    while (team_alive_count(p1) > 0 && team_alive_count(p2) > 0) {
+        pc = &p1->members[p1->active];
+        ec = &p2->members[p2->active];
+
+        clear_ui_text();
+        sprintf(buffer, "%s HP:%ld", ec->name, ec->hp);
+        print_text(1, 1, buffer, 15);
+        sprintf(buffer, "%s HP:%ld", pc->name, pc->hp);
+        print_text(15, 20, buffer, 15);
+
+        print_text(19, 2, "Action:", 14);
+        print_text(21, 4, "1. Atk", action == 1 ? 15 : 7);
+        print_text(22, 4, "2. Item", action == 2 ? 15 : 7);
+
+        key = read_key();
+        if (key == '1' || key == KEY_UP) action = 1;
+        if (key == '2' || key == KEY_DOWN) action = 2;
+
+        if (key == KEY_ENTER) {
+            clear_ui_text();
+            if (action == 1) {
+                sprintf(buffer, "%s uses %s!", pc->name, pc->moves[0].name);
+                print_text(20, 2, buffer, 15);
+                ec->hp -= (pc->base_atk + pc->moves[0].power) - ec->base_def;
+            }
+            print_text(22, 2, "Press Key...", 14); getch();
+
+            if (ec->hp <= 0) {
+                next_idx = team_next_alive(p2, 0);
+                if (next_idx >= 0) {
+                    p2->active = next_idx;
+                    ec = &p2->members[p2->active];
+                    clear_ui_text();
+                    sprintf(buffer, "Enemy sends out %s!", ec->name);
+                    print_text(20, 2, buffer, 14);
+                    print_text(22, 2, "Press Key...", 14); getch();
+                    draw_full_battle(p1, p2, bg);
+                }
+                /* if next_idx < 0, enemy team is wiped; outer while() ends the battle */
+            } else {
+                clear_ui_text();
+                sprintf(buffer, "%s attacks!", ec->name);
+                print_text(20, 2, buffer, 12);
+                pc->hp -= ec->base_atk;
+                print_text(22, 2, "Press Key...", 14); getch();
+
+                if (pc->hp <= 0 && team_alive_count(p1) > 0) {
+                    next_idx = choose_next_character(p1, "Your fighter fainted!");
+                    if (next_idx >= 0) {
+                        p1->active = next_idx;
+                        draw_full_battle(p1, p2, bg);
+                    }
+                }
+            }
+        }
+    }
+
     clear_ui_text();
-    sprintf(buffer, "%s Wins!", player->hp > 0 ? player->name : enemy->name);
-    print_text(20, 4, buffer, 14); 
+    sprintf(buffer, "%s Wins!", team_alive_count(p1) > 0 ? "Player" : "Enemy");
+    print_text(20, 4, buffer, 14);
     getch();
 }
 
 int main() {
-    // ALL variables declared at the top of the block! (Strict C89)
-    int running = 1, selection = 1, bg_sel = 0, p1_sel = 0, p2_sel = 0;
-    char key; 
-    Character player, enemy; 
-    Background bg;
-    char roster[20][64];        
-    char display_names[20][16]; 
-    int roster_count = 0;
+    /* ALL variables declared at the top of the block! (Strict C89) */
+    int running, selection, bg_sel;
+    int key;
+    static Team p1team, p2team;
+    static Background bg;
+    static char roster[MAX_ROSTER][64];
+    static char display_names[MAX_ROSTER][16];
+    int roster_count;
     struct find_t fileinfo;
     unsigned rc;
-    char *dot;
-    int cust_menu;
+    char* dot;
+    int cust_menu, cust_cursor, activate;
+    static int p1_idx[MAX_TEAM], p2_idx[MAX_TEAM];
+    int p1_count, p2_count;
+    int i;
+    char buffer[48];
 
-    // Scan Content Directory
+    running = 1;
+    selection = 1;
+    bg_sel = 0;
+    roster_count = 0;
+    cust_cursor = 1;
+    p1_count = 0;
+    p2_count = 0;
+
+    /* Scan Content Directory */
     rc = _dos_findfirst("content\\*.chr", _A_NORMAL, &fileinfo);
-    while (rc == 0 && roster_count < 20) {
+    while (rc == 0 && roster_count < MAX_ROSTER) {
         sprintf(roster[roster_count], "content\\%s", fileinfo.name);
-        
+
         strncpy(display_names[roster_count], fileinfo.name, 15);
         display_names[roster_count][15] = '\0';
         dot = strchr(display_names[roster_count], '.');
@@ -152,70 +365,106 @@ int main() {
         rc = _dos_findnext(&fileinfo);
     }
 
-    if (roster_count > 1) { p2_sel = 1; } 
+    /* Sensible defaults so "Play" works before visiting Customize */
+    if (roster_count > 0) {
+        p1_idx[0] = 0;
+        p1_count = 1;
+        p2_idx[0] = (roster_count > 1) ? 1 : 0;
+        p2_count = 1;
+    }
 
     set_video_mode(0x13);
 
-    while(running) {
-        draw_rect(0, 0, 320, 200, 0); 
+    while (running) {
+        draw_rect(0, 0, 320, 200, 0);
         print_text(5, 14, "DOSTCG", 14);
         print_text(11, 12, "1. Play Game", selection == 1 ? 15 : 7);
         print_text(13, 12, "2. Customize", selection == 2 ? 15 : 7);
         print_text(15, 12, "3. Exit", selection == 3 ? 15 : 7);
 
-        key = getch();
-        if(key == '1') selection = 1; 
-        if(key == '2') selection = 2; 
-        if(key == '3') selection = 3;
+        key = read_key();
+        if (key == '1') selection = 1;
+        if (key == '2') selection = 2;
+        if (key == '3') selection = 3;
+        if (key == KEY_UP) { selection--; if (selection < 1) selection = 3; }
+        if (key == KEY_DOWN) { selection++; if (selection > 3) selection = 1; }
 
-        if(key == 0x0D) {
-            if(selection == 1) {
-                if(roster_count == 0) {
+        if (key == KEY_ENTER) {
+            if (selection == 1) {
+                if (roster_count == 0) {
                     draw_rect(0, 0, 320, 200, 0);
                     print_text(10, 5, "Error: No .chr files found!", 12); getch(); continue;
                 }
-                
-                if(!load_character(roster[p1_sel], &player) || 
-                   !load_character(roster[p2_sel], &enemy) || 
-                   !load_core_bg(bg_sel, &bg)) {
+
+                p1team.count = p1_count;
+                p2team.count = p2_count;
+                for (i = 0; i < p1_count; i++) load_character(roster[p1_idx[i]], &p1team.members[i]);
+                for (i = 0; i < p2_count; i++) load_character(roster[p2_idx[i]], &p2team.members[i]);
+
+                if (!load_core_bg(bg_sel, &bg)) {
                     draw_rect(0, 0, 320, 200, 0);
                     print_text(10, 5, "Error loading match data!", 12); getch(); continue;
                 }
-                
-                battle_scene(&player, &enemy, &bg);
-                
-                // Cleanup RAM using Watcom's _ffree
-                if(player.sprite_data) _ffree(player.sprite_data); 
-                if(enemy.sprite_data) _ffree(enemy.sprite_data);
+
+                battle_scene(&p1team, &p2team, &bg);
+
+                /* Cleanup RAM using Watcom's _ffree */
+                for (i = 0; i < p1team.count; i++)
+                    if (p1team.members[i].sprite_data) _ffree(p1team.members[i].sprite_data);
+                for (i = 0; i < p2team.count; i++)
+                    if (p2team.members[i].sprite_data) _ffree(p2team.members[i].sprite_data);
             }
-            else if(selection == 2) {
+            else if (selection == 2) {
                 cust_menu = 1;
-                while(cust_menu) {
+                cust_cursor = 1;
+                while (cust_menu) {
                     draw_rect(0, 0, 320, 200, 0);
                     print_text(2, 5, "--- CUSTOMIZE MATCH ---", 14);
-                    
-                    if(roster_count == 0) {
+
+                    if (roster_count == 0) {
                         print_text(6, 5, "NO CHARACTERS IN /CONTENT!", 12);
                     } else {
-                        print_text(6, 5, "1. Player: ", 15); print_text(6, 17, display_names[p1_sel], 11);
-                        print_text(8, 5, "2. Enemy:  ", 15); print_text(8, 17, display_names[p2_sel], 12);
+                        sprintf(buffer, "1. Player Team: %d/%d picked", p1_count, MAX_TEAM);
+                        print_text(6, 5, buffer, cust_cursor == 1 ? 15 : 11);
+                        sprintf(buffer, "2. Enemy Team:  %d/%d picked", p2_count, MAX_TEAM);
+                        print_text(8, 5, buffer, cust_cursor == 2 ? 15 : 12);
                     }
-                    
-                    print_text(10, 5, "3. Arena:  ", 15); 
-                    print_text(10, 17, bg_sel==0 ? "Grass" : (bg_sel==1 ? "Water" : "Fire"), 10);
-                    print_text(14, 5, "Press 1,2,3 to cycle.", 7);
-                    print_text(16, 5, "Press ENTER to return.", 7);
-                    
-                    key = getch();
-                    if(key == '1' && roster_count > 0) p1_sel = (p1_sel + 1) % roster_count;
-                    if(key == '2' && roster_count > 0) p2_sel = (p2_sel + 1) % roster_count;
-                    if(key == '3') bg_sel = (bg_sel + 1) % 3; 
-                    if(key == 0x0D) cust_menu = 0;
+
+                    sprintf(buffer, "3. Arena: %s", bg_sel == 0 ? "Grass" : (bg_sel == 1 ? "Water" : "Fire"));
+                    print_text(10, 5, buffer, cust_cursor == 3 ? 15 : 10);
+                    print_text(12, 5, "4. Back", cust_cursor == 4 ? 15 : 7);
+
+                    print_text(15, 5, "Arrows/1-4: move  ENTER: select", 7);
+                    print_text(16, 5, "ESC: back", 7);
+
+                    key = read_key();
+                    activate = 0;
+
+                    if (key == '1') { cust_cursor = 1; activate = 1; }
+                    if (key == '2') { cust_cursor = 2; activate = 1; }
+                    if (key == '3') { cust_cursor = 3; activate = 1; }
+                    if (key == '4') { cust_cursor = 4; activate = 1; }
+                    if (key == KEY_UP) { cust_cursor--; if (cust_cursor < 1) cust_cursor = 4; }
+                    if (key == KEY_DOWN) { cust_cursor++; if (cust_cursor > 4) cust_cursor = 1; }
+                    if (key == KEY_ENTER) activate = 1;
+                    if (key == KEY_ESC) cust_menu = 0;
+
+                    if (activate && cust_cursor == 4) {
+                        cust_menu = 0;
+                    } else if (activate && roster_count > 0) {
+                        if (cust_cursor == 1) {
+                            p1_count = select_team(display_names, roster_count, p1_idx, "SELECT YOUR TEAM (up to 4)");
+                        } else if (cust_cursor == 2) {
+                            p2_count = select_team(display_names, roster_count, p2_idx, "SELECT ENEMY TEAM (up to 4)");
+                        } else if (cust_cursor == 3) {
+                            bg_sel = (bg_sel + 1) % 3;
+                        }
+                    }
                 }
             }
-            else if(selection == 3) { running = 0; }
+            else if (selection == 3) { running = 0; }
         }
     }
-    set_video_mode(0x03); 
+    set_video_mode(0x03);
     return 0;
 }
