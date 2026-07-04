@@ -328,15 +328,59 @@ long compute_damage(Character* attacker, Move* move, Character* defender) {
     return dmg;
 }
 
+/* Move types: 0=Attack, 1=Heal, 2=Buff_Atk, 3=Debuff_Def.
+   Applies the move's effect (damage/heal/stat change) and writes two lines
+   of battle text: line1 is the "X uses Y!" announcement, line2 describes
+   what happened as a result. Both buffers should be at least 50 bytes. */
+void resolve_move(Character* attacker, Move* move, Character* defender, char* line1, char* line2) {
+    long dmg, amt;
+
+    sprintf(line1, "%s uses %s!", attacker->name, move->name);
+
+    switch (move->type) {
+        case 0: /* Attack */
+            dmg = compute_damage(attacker, move, defender);
+            defender->hp -= dmg;
+            if (defender->hp > defender->max_hp) defender->hp = defender->max_hp;
+            if (defender->hp < 0) defender->hp = 0;
+            sprintf(line2, "%s takes %ld damage!", defender->name, dmg);
+            break;
+
+        case 1: /* Heal */
+            amt = move->power;
+            attacker->hp += amt;
+            if (attacker->hp > attacker->max_hp) attacker->hp = attacker->max_hp;
+            sprintf(line2, "%s recovers %ld HP!", attacker->name, amt);
+            break;
+
+        case 2: /* Buff Atk */
+            amt = move->power;
+            attacker->base_atk += amt;
+            sprintf(line2, "%s's attack rose!", attacker->name);
+            break;
+
+        case 3: /* Debuff Def */
+            amt = move->power;
+            defender->base_def -= amt;
+            if (defender->base_def < 0) defender->base_def = 0;
+            sprintf(line2, "%s's defense fell!", defender->name);
+            break;
+
+        default:
+            sprintf(line2, "...but nothing happened!");
+            break;
+    }
+}
+
 void battle_scene(Team* p1, Team* p2, Background* bg) {
     char buffer[50];
+    char buffer2[50];
     int action;
     int key;
     Character* pc;
     Character* ec;
     int next_idx;
     int move_idx;
-    long dmg;
 
     action = 1;
     p1->active = team_next_alive(p1, 0);
@@ -376,10 +420,9 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
 
             clear_ui_text();
             if (action == 1) {
-                dmg = compute_damage(pc, &pc->moves[move_idx], ec);
-                sprintf(buffer, "%s uses %s!", pc->name, pc->moves[move_idx].name);
+                resolve_move(pc, &pc->moves[move_idx], ec, buffer, buffer2);
                 print_text(20, 2, buffer, 15);
-                ec->hp -= dmg;
+                print_text(21, 2, buffer2, 15);
             }
             print_text(22, 2, "Press Key...", 14); getch();
 
@@ -399,10 +442,9 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
                 clear_ui_text();
                 move_idx = ai_pick_move(ec);
                 if (move_idx >= 0) {
-                    dmg = compute_damage(ec, &ec->moves[move_idx], pc);
-                    sprintf(buffer, "%s uses %s!", ec->name, ec->moves[move_idx].name);
+                    resolve_move(ec, &ec->moves[move_idx], pc, buffer, buffer2);
                     print_text(20, 2, buffer, 12);
-                    pc->hp -= dmg;
+                    print_text(21, 2, buffer2, 12);
                 } else {
                     sprintf(buffer, "%s has no moves!", ec->name);
                     print_text(20, 2, buffer, 12);
