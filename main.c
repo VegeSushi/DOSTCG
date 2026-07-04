@@ -423,6 +423,7 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
     clear_ui_text();
     sprintf(buffer, "%s Wins!", team_alive_count(p1) > 0 ? "Player" : "Enemy");
     print_text(20, 4, buffer, 14);
+    print_text(22, 4, "Press any key...", 7);
     getch();
 }
 
