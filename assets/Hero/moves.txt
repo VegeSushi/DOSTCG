@@ -1,0 +1,5 @@
+# Format: Move Name, Type (0=Attack, 1=Heal, 2=Buff_Atk, 3=Debuff_Def), Power
+Slash,0,20
+Potion,1,50
+Focus,2,5
+Intimidate,3,5
