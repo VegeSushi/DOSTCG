@@ -1,4 +1,0 @@
-# name,type,power
-Stab,1,8
-Cheap Shot,1,5
-Rock Throw,1,11

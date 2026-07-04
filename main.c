@@ -74,6 +74,8 @@ int load_character(const char* filename, Character* target) {
     fread(&entry, sizeof(ArchiveEntry), 1, f);
     fread(target->name, 16, 1, f);
     fread(&target->max_hp, 4, 1, f); fread(&target->hp, 4, 1, f);
+    if (target->hp > target->max_hp) target->hp = target->max_hp;
+    if (target->hp < 0) target->hp = 0;
     fread(&target->base_atk, 4, 1, f); fread(&target->base_def, 4, 1, f);
     fread(&target->pad1, 4, 1, f); fread(&target->pad2, 4, 1, f);
 
@@ -163,7 +165,7 @@ int select_move(Character* pc) {
 
         for (i = 0; i < MAX_MOVES; i++) {
             if (!move_is_valid(&pc->moves[i])) continue;
-            sprintf(buffer, "%d. %s (PWR:%ld)", i + 1, pc->moves[i].name, pc->moves[i].power);
+            sprintf(buffer, "%d. %.15s (PWR:%ld)", i + 1, pc->moves[i].name, pc->moves[i].power);
             print_text(21 + i, 4, buffer, (cursor == i) ? 15 : 7);
         }
 
@@ -228,7 +230,7 @@ int select_team(char display_names[][16], int roster_count, int* chosen, const c
         for (i = 0; i < visible; i++) {
             found_idx = -1;
             for (j = 0; j < MAX_TEAM; j++) if (chosen[j] == i) found_idx = j;
-            sprintf(buffer, "%s %d. %s", (found_idx >= 0) ? "[X]" : "[ ]", i + 1, display_names[i]);
+            sprintf(buffer, "%s %d. %.15s", (found_idx >= 0) ? "[X]" : "[ ]", i + 1, display_names[i]);
             print_text(6 + i, 4, buffer, (cursor == i) ? 15 : ((found_idx >= 0) ? 10 : 7));
         }
         print_text(6 + visible, 4, "[ DONE ]", (cursor == visible) ? 15 : 12);
@@ -286,10 +288,10 @@ int choose_next_character(Team* t, const char* label) {
 
         for (i = 0; i < t->count; i++) {
             if (t->members[i].hp <= 0) {
-                sprintf(buffer, "%d. %s (FAINTED)", i + 1, t->members[i].name);
+                sprintf(buffer, "%d. %.15s (FAINTED)", i + 1, t->members[i].name);
                 print_text(6 + i, 4, buffer, 8);
             } else {
-                sprintf(buffer, "%d. %s HP:%ld", i + 1, t->members[i].name, t->members[i].hp);
+                sprintf(buffer, "%d. %.15s HP:%ld", i + 1, t->members[i].name, t->members[i].hp);
                 print_text(6 + i, 4, buffer, (cursor == i) ? 15 : 7);
             }
         }
@@ -325,6 +327,7 @@ long compute_damage(Character* attacker, Move* move, Character* defender) {
     long dmg;
     dmg = (attacker->base_atk + move->power) - defender->base_def;
     if (dmg < 1) dmg = 1;
+    if (dmg > 9999) dmg = 9999; /* defensive cap: guards against overflowed/corrupt stats */
     return dmg;
 }
 
@@ -335,35 +338,36 @@ long compute_damage(Character* attacker, Move* move, Character* defender) {
 void resolve_move(Character* attacker, Move* move, Character* defender, char* line1, char* line2) {
     long dmg, amt;
 
-    sprintf(line1, "%s uses %s!", attacker->name, move->name);
+    sprintf(line1, "%.15s uses %.15s!", attacker->name, move->name);
 
     switch (move->type) {
         case 0: /* Attack */
             dmg = compute_damage(attacker, move, defender);
             defender->hp -= dmg;
-            if (defender->hp > defender->max_hp) defender->hp = defender->max_hp;
             if (defender->hp < 0) defender->hp = 0;
-            sprintf(line2, "%s takes %ld damage!", defender->name, dmg);
+            if (defender->hp > defender->max_hp) defender->hp = defender->max_hp;
+            sprintf(line2, "%.15s takes %ld damage!", defender->name, dmg);
             break;
 
         case 1: /* Heal */
             amt = move->power;
             attacker->hp += amt;
             if (attacker->hp > attacker->max_hp) attacker->hp = attacker->max_hp;
-            sprintf(line2, "%s recovers %ld HP!", attacker->name, amt);
+            sprintf(line2, "%.15s recovers %ld HP!", attacker->name, amt);
             break;
 
         case 2: /* Buff Atk */
             amt = move->power;
             attacker->base_atk += amt;
-            sprintf(line2, "%s's attack rose!", attacker->name);
+            if (attacker->base_atk > 9999) attacker->base_atk = 9999;
+            sprintf(line2, "%.15s's attack rose!", attacker->name);
             break;
 
         case 3: /* Debuff Def */
             amt = move->power;
             defender->base_def -= amt;
             if (defender->base_def < 0) defender->base_def = 0;
-            sprintf(line2, "%s's defense fell!", defender->name);
+            sprintf(line2, "%.15s's defense fell!", defender->name);
             break;
 
         default:
@@ -393,9 +397,12 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
         ec = &p2->members[p2->active];
 
         clear_ui_text();
-        sprintf(buffer, "%s HP:%ld", ec->name, ec->hp);
+        /* Enemy HP Update */
+        sprintf(buffer, "%.15s HP:%-4ld", ec->name, ec->hp);
         print_text(1, 1, buffer, 15);
-        sprintf(buffer, "%s HP:%ld", pc->name, pc->hp);
+
+        /* Player HP Update */
+        sprintf(buffer, "%.15s HP:%-4ld", pc->name, pc->hp);
         print_text(15, 20, buffer, 15);
 
         print_text(19, 2, "Action:", 14);
@@ -432,7 +439,7 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
                     p2->active = next_idx;
                     ec = &p2->members[p2->active];
                     clear_ui_text();
-                    sprintf(buffer, "Enemy sends out %s!", ec->name);
+                    sprintf(buffer, "Enemy sends out %.15s!", ec->name);
                     print_text(20, 2, buffer, 14);
                     print_text(22, 2, "Press Key...", 14); getch();
                     draw_full_battle(p1, p2, bg);
@@ -446,7 +453,7 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
                     print_text(20, 2, buffer, 12);
                     print_text(21, 2, buffer2, 12);
                 } else {
-                    sprintf(buffer, "%s has no moves!", ec->name);
+                    sprintf(buffer, "%.15s has no moves!", ec->name);
                     print_text(20, 2, buffer, 12);
                 }
                 print_text(22, 2, "Press Key...", 14); getch();
