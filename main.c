@@ -4,6 +4,7 @@
 #include <conio.h>
 #include <malloc.h>
 #include <dos.h>
+#include <time.h>
 #include "types.h"
 
 extern void set_video_mode(unsigned char mode);
@@ -15,6 +16,7 @@ extern void print_text(int row, int col, const char* str, unsigned char color);
 #define MAX_TEAM 4
 #define MAX_ROSTER 20
 #define MAX_VISIBLE 15
+#define MAX_MOVES 4
 
 /* Translated key codes (kept well outside char/ASCII range) */
 #define KEY_UP    1000
@@ -125,6 +127,75 @@ int team_next_alive(Team* t, int start) {
     int i;
     for (i = start; i < t->count; i++) if (t->members[i].hp > 0) return i;
     return -1;
+}
+
+/* --- MOVE HELPERS ---
+   A move slot is "empty" if the packer left it as the "None" placeholder.
+   We only ever show/consider valid (non-empty) moves to the player or the AI. */
+int move_is_valid(Move* m) {
+    return (m->name[0] != '\0' && strncmp(m->name, "None", 4) != 0);
+}
+
+int count_valid_moves(Character* c) {
+    int i, n;
+    n = 0;
+    for (i = 0; i < MAX_MOVES; i++) if (move_is_valid(&c->moves[i])) n++;
+    return n;
+}
+
+/* Player move-select screen. Returns move index (0..3), or -1 if cancelled. */
+int select_move(Character* pc) {
+    int cursor;
+    int key;
+    int i;
+    int done;
+    int chosen;
+    char buffer[48];
+
+    cursor = 0;
+    for (i = 0; i < MAX_MOVES; i++) { if (move_is_valid(&pc->moves[i])) { cursor = i; break; } }
+
+    done = 0;
+    chosen = -1;
+    while (!done) {
+        clear_ui_text();
+        print_text(19, 2, "Choose a move (ESC: back):", 14);
+
+        for (i = 0; i < MAX_MOVES; i++) {
+            if (!move_is_valid(&pc->moves[i])) continue;
+            sprintf(buffer, "%d. %s (PWR:%ld)", i + 1, pc->moves[i].name, pc->moves[i].power);
+            print_text(21 + i, 4, buffer, (cursor == i) ? 15 : 7);
+        }
+
+        key = read_key();
+        if (key == KEY_UP) {
+            do { cursor--; if (cursor < 0) cursor = MAX_MOVES - 1; } while (!move_is_valid(&pc->moves[cursor]));
+        } else if (key == KEY_DOWN) {
+            do { cursor++; if (cursor >= MAX_MOVES) cursor = 0; } while (!move_is_valid(&pc->moves[cursor]));
+        } else if (key >= '1' && key <= '4') {
+            i = key - '1';
+            if (i < MAX_MOVES && move_is_valid(&pc->moves[i])) cursor = i;
+        } else if (key == KEY_ENTER) {
+            if (move_is_valid(&pc->moves[cursor])) { chosen = cursor; done = 1; }
+        } else if (key == KEY_ESC) {
+            done = 1; /* chosen stays -1 */
+        }
+    }
+    return chosen;
+}
+
+/* AI: pick uniformly at random among the character's valid moves. */
+int ai_pick_move(Character* ec) {
+    int valid_idx[MAX_MOVES];
+    int n, i, pick;
+
+    n = 0;
+    for (i = 0; i < MAX_MOVES; i++) {
+        if (move_is_valid(&ec->moves[i])) { valid_idx[n] = i; n++; }
+    }
+    if (n == 0) return -1;
+    pick = rand() % n;
+    return valid_idx[pick];
 }
 
 /* --- TEAM SELECTION SCREEN (up to MAX_TEAM cards, arrow keys + numbers) --- */
@@ -248,6 +319,15 @@ void draw_full_battle(Team* p1, Team* p2, Background* bg) {
     draw_ui_box();
 }
 
+/* Damage is always at least 1: prevents (atk+power)-def from going negative
+   and healing the target instead of hurting it. */
+long compute_damage(Character* attacker, Move* move, Character* defender) {
+    long dmg;
+    dmg = (attacker->base_atk + move->power) - defender->base_def;
+    if (dmg < 1) dmg = 1;
+    return dmg;
+}
+
 void battle_scene(Team* p1, Team* p2, Background* bg) {
     char buffer[50];
     int action;
@@ -255,6 +335,8 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
     Character* pc;
     Character* ec;
     int next_idx;
+    int move_idx;
+    long dmg;
 
     action = 1;
     p1->active = team_next_alive(p1, 0);
@@ -281,11 +363,23 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
         if (key == '2' || key == KEY_DOWN) action = 2;
 
         if (key == KEY_ENTER) {
+            move_idx = -1;
+            if (action == 1) {
+                move_idx = select_move(pc);
+            }
+
+            if (action == 1 && move_idx < 0) {
+                /* Player backed out of the move menu; redraw and let them pick again. */
+                draw_full_battle(p1, p2, bg);
+                continue;
+            }
+
             clear_ui_text();
             if (action == 1) {
-                sprintf(buffer, "%s uses %s!", pc->name, pc->moves[0].name);
+                dmg = compute_damage(pc, &pc->moves[move_idx], ec);
+                sprintf(buffer, "%s uses %s!", pc->name, pc->moves[move_idx].name);
                 print_text(20, 2, buffer, 15);
-                ec->hp -= (pc->base_atk + pc->moves[0].power) - ec->base_def;
+                ec->hp -= dmg;
             }
             print_text(22, 2, "Press Key...", 14); getch();
 
@@ -303,9 +397,16 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
                 /* if next_idx < 0, enemy team is wiped; outer while() ends the battle */
             } else {
                 clear_ui_text();
-                sprintf(buffer, "%s attacks!", ec->name);
-                print_text(20, 2, buffer, 12);
-                pc->hp -= ec->base_atk;
+                move_idx = ai_pick_move(ec);
+                if (move_idx >= 0) {
+                    dmg = compute_damage(ec, &ec->moves[move_idx], pc);
+                    sprintf(buffer, "%s uses %s!", ec->name, ec->moves[move_idx].name);
+                    print_text(20, 2, buffer, 12);
+                    pc->hp -= dmg;
+                } else {
+                    sprintf(buffer, "%s has no moves!", ec->name);
+                    print_text(20, 2, buffer, 12);
+                }
                 print_text(22, 2, "Press Key...", 14); getch();
 
                 if (pc->hp <= 0 && team_alive_count(p1) > 0) {
@@ -342,6 +443,8 @@ int main() {
     int p1_count, p2_count;
     int i;
     char buffer[48];
+
+    srand((unsigned)time(NULL));
 
     running = 1;
     selection = 1;

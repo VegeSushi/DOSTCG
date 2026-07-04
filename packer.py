@@ -1,6 +1,5 @@
 import os
 import struct
-
 def pack_character(char_folder, output_file):
     print(f"Packing {char_folder} into {output_file}...")
     stats_path = os.path.join(char_folder, 'stats.txt')
@@ -51,7 +50,6 @@ def pack_character(char_folder, output_file):
             f.write(m[0])
             f.write(struct.pack('<ii', m[1], m[2]))
         f.write(sprite_data)
-
 def pack_core():
     # Packs 3 backgrounds into core.pak
     output = "content/core.pak"
@@ -68,7 +66,6 @@ def pack_core():
         for bg in bgs:
             f.write(bg[0])
             f.write(struct.pack('<B', bg[1]))
-
 if __name__ == "__main__":
     os.makedirs("content", exist_ok=True)
     assets_dir = "./assets"
