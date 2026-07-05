@@ -688,6 +688,60 @@ int net_recv_team(int port, Team* t, long timeout_ticks) {
     return 1;
 }
 
+#define TEAM_ACK_BYTE  0x06
+#define TEAM_NACK_BYTE 0x15
+#define TEAM_ACK_WAIT_TIMEOUT (10L * BIOS_TICKS_TIMEOUT)  /* peer acks right after
+    checking the checksum, so this only needs to cover transfer+processing time */
+#define TEAM_DATA_ARRIVE_TIMEOUT (120L * BIOS_TICKS_TIMEOUT) /* team data (incl.
+    sprites) can take a while to cross a 9600-baud link - not a human-thinking
+    wait like the ready rendezvous, just genuine transfer time */
+
+/* Sends a team and then WAITS for the peer to explicitly ACK it before
+   returning success. This is the piece that was missing before: without an
+   ack, a sender that transmitted fine had no way to know its peer's
+   checksum check on the *other* direction had failed and was retrying -
+   so the sender would sail on into battle alone while the peer sat
+   pinging for a partner who had already left. Now nobody moves on until
+   both sides agree this leg of the exchange actually succeeded. */
+int net_send_team_reliable(int port, Team* t, int max_retries) {
+    int attempt;
+    unsigned char ack;
+
+    for (attempt = 1; attempt <= max_retries; attempt++) {
+        net_send_team(port, t);
+        if (serial_recv_byte(port, &ack, TEAM_ACK_WAIT_TIMEOUT) && ack == TEAM_ACK_BYTE) {
+            return 1;
+        }
+        net_log("net_send_team_reliable: no ACK (or NACK) - resending");
+    }
+    return 0;
+}
+
+/* Receives a team, checks it, and explicitly ACKs/NACKs so the sender
+   knows whether to move on or resend. Loops internally on a NACK-worthy
+   mismatch so the caller only sees a final success/failure. */
+int net_recv_team_reliable(int port, Team* t, int max_retries) {
+    int attempt;
+    int result;
+
+    for (attempt = 1; attempt <= max_retries; attempt++) {
+        result = net_recv_team(port, t, TEAM_DATA_ARRIVE_TIMEOUT);
+        if (result == 1) {
+            serial_send_byte(port, TEAM_ACK_BYTE);
+            return 1;
+        }
+        if (result == 0) {
+            /* genuine link timeout/failure - nothing arrived to NACK */
+            return 0;
+        }
+        /* result == -1: got something, but it was scrambled - tell the
+           sender to try again instead of silently giving up. */
+        net_log("net_recv_team_reliable: NACKing scrambled team data");
+        serial_send_byte(port, TEAM_NACK_BYTE);
+    }
+    return 0;
+}
+
 /* Mutual "ready" rendezvous: keeps pinging a marker byte and watching for
    the peer's own marker, so NEITHER side starts streaming the (large,
    slow) team payload until it knows the other side has also finished
@@ -943,48 +997,40 @@ void multiplayer_menu(char roster[][64], char display_names[][16], int roster_co
     }
 
     {
-        int attempt, ok;
-        long recv_timeout;
+        int ok;
 
-        for (attempt = 1; attempt <= TEAM_SEND_MAX_RETRIES; attempt++) {
-            sprintf(buffer, "team exchange: attempt %d of %d", attempt, TEAM_SEND_MAX_RETRIES);
-            net_log(buffer);
-            /* Give it plenty of time on the first try (still nothing but a
-               link problem could explain a stall here now), then shorter
-               once we know we might need to just retry the framed send. */
-            recv_timeout = (attempt == 1) ? TEAM_EXCHANGE_TIMEOUT : 10L * BIOS_TICKS_TIMEOUT;
-
-            /* Fixed order avoids both sides trying to send at once: host sends first. */
-            if (is_host) {
-                net_log("team exchange: sending host team");
-                net_send_team(port, &host_team);
-                net_log("team exchange: waiting to receive client team");
-                ok = net_recv_team(port, &client_team, recv_timeout);
-            } else {
-                net_log("team exchange: waiting to receive host team");
-                ok = net_recv_team(port, &host_team, recv_timeout);
-                if (ok == 1) {
-                    net_log("team exchange: sending client team");
-                    net_send_team(port, &client_team);
-                }
-            }
-
-            if (ok == 1) break;
-
-            if (ok == 0) {
-                net_log("team exchange: TIMED OUT / link problem");
+        /* Each direction is now fully confirmed (ACK'd) by both sides
+           before anyone moves on - this is what the old attempt-loop was
+           missing: a checksum mismatch used to only be visible to the
+           receiver, so the sender (who'd already succeeded) would walk
+           into battle while the receiver kept retrying alone, waiting for
+           a partner who had already left. Now nobody proceeds past a
+           given direction until both machines agree it went through. */
+        if (is_host) {
+            net_log("team exchange: sending host team");
+            ok = net_send_team_reliable(port, &host_team, TEAM_SEND_MAX_RETRIES);
+            if (!ok) {
+                net_log("team exchange: host team never got ACK'd");
                 print_text(12, 5, "Connection lost.", 12); getch(); serial_close(port); return;
             }
-
-            /* ok == -1: bytes arrived scrambled/out of sync - resync and retry
-               rather than giving up outright. */
-            net_log("team exchange: retrying after scrambled data");
-            print_text(12, 5, "Hiccup - retrying...       ", 12);
-            if (attempt == TEAM_SEND_MAX_RETRIES) {
+            net_log("team exchange: waiting to receive client team");
+            ok = net_recv_team_reliable(port, &client_team, TEAM_SEND_MAX_RETRIES);
+            if (!ok) {
+                net_log("team exchange: never got a valid client team");
                 print_text(12, 5, "Connection lost.", 12); getch(); serial_close(port); return;
             }
-            if (!wait_for_peer_ready(port)) {
-                print_text(12, 5, "Connection cancelled.", 12); getch(); serial_close(port); return;
+        } else {
+            net_log("team exchange: waiting to receive host team");
+            ok = net_recv_team_reliable(port, &host_team, TEAM_SEND_MAX_RETRIES);
+            if (!ok) {
+                net_log("team exchange: never got a valid host team");
+                print_text(12, 5, "Connection lost.", 12); getch(); serial_close(port); return;
+            }
+            net_log("team exchange: sending client team");
+            ok = net_send_team_reliable(port, &client_team, TEAM_SEND_MAX_RETRIES);
+            if (!ok) {
+                net_log("team exchange: client team never got ACK'd");
+                print_text(12, 5, "Connection lost.", 12); getch(); serial_close(port); return;
             }
         }
     }
