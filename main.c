@@ -36,7 +36,7 @@ extern void print_text(int row, int col, const char* str, unsigned char color);
 #define READY_LINK_SILENCE_TIMEOUT (600L * BIOS_TICKS_TIMEOUT) /* only give up if the
     link has been TOTALLY silent (no bytes at all, not even a stray one) this long -
     that means the cable/link is actually dead, not just "still picking a team". */
-#define TEAM_SEND_MAX_RETRIES 5
+#define TEAM_SEND_MAX_RETRIES 10
 
 #define MOVE_WAIT_TIMEOUT (600L * BIOS_TICKS_TIMEOUT) /* ~10 minutes: waiting for the
     OTHER player's move/next-fighter pick is bounded by how long a human takes to
@@ -690,11 +690,19 @@ int net_recv_team(int port, Team* t, long timeout_ticks) {
 
 #define TEAM_ACK_BYTE  0x06
 #define TEAM_NACK_BYTE 0x15
-#define TEAM_ACK_WAIT_TIMEOUT (10L * BIOS_TICKS_TIMEOUT)  /* peer acks right after
-    checking the checksum, so this only needs to cover transfer+processing time */
-#define TEAM_DATA_ARRIVE_TIMEOUT (120L * BIOS_TICKS_TIMEOUT) /* team data (incl.
+/* A full team (up to 4 characters, each carrying a 4096-byte sprite) is
+   roughly 16KB. At 9600 baud that alone takes ~17 seconds to physically
+   cross the wire, before the receiver can even finish checksumming and
+   send back an ACK. The ACK wait MUST be comfortably longer than that
+   worst-case transfer time - otherwise the sender gives up and resends
+   while the first copy is still mid-flight, which interleaves two
+   copies on the wire and corrupts both (this used to be the actual
+   cause of the "scrambled data" retries, not a real link problem). */
+#define TEAM_ACK_WAIT_TIMEOUT (90L * BIOS_TICKS_TIMEOUT)
+#define TEAM_DATA_ARRIVE_TIMEOUT (90L * BIOS_TICKS_TIMEOUT) /* team data (incl.
     sprites) can take a while to cross a 9600-baud link - not a human-thinking
-    wait like the ready rendezvous, just genuine transfer time */
+    wait like the ready rendezvous, just genuine transfer time, so this must
+    stay in step with TEAM_ACK_WAIT_TIMEOUT above. */
 
 /* Sends a team and then WAITS for the peer to explicitly ACK it before
    returning success. This is the piece that was missing before: without an
@@ -713,6 +721,7 @@ int net_send_team_reliable(int port, Team* t, int max_retries) {
             return 1;
         }
         net_log("net_send_team_reliable: no ACK (or NACK) - resending");
+        serial_drain_rx(port); /* clear anything stray before the next attempt */
     }
     return 0;
 }
@@ -738,6 +747,7 @@ int net_recv_team_reliable(int port, Team* t, int max_retries) {
            sender to try again instead of silently giving up. */
         net_log("net_recv_team_reliable: NACKing scrambled team data");
         serial_send_byte(port, TEAM_NACK_BYTE);
+        serial_drain_rx(port); /* clear any trailing garbage before the resend arrives */
     }
     return 0;
 }
