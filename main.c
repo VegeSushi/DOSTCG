@@ -6,6 +6,7 @@
 #include <dos.h>
 #include <time.h>
 #include "types.h"
+#include "serial.h"
 
 extern void set_video_mode(unsigned char mode);
 extern void draw_sprite(int start_x, int start_y, unsigned char far* sprite);
@@ -25,6 +26,24 @@ extern void print_text(int row, int col, const char* str, unsigned char color);
 #define KEY_RIGHT 1003
 #define KEY_ENTER 0x0D
 #define KEY_ESC   0x1B
+
+#define BIOS_TICKS_TIMEOUT 18L /* ~1 second, BIOS tick counter runs at ~18.2 Hz */
+#define TEAM_EXCHANGE_TIMEOUT (600L * BIOS_TICKS_TIMEOUT) /* ~10 minutes: this only
+    happens once, while a human is still browsing the team-select screen, so it
+    needs to be generous rather than tuned like the in-battle timeouts. */
+
+#define READY_BYTE 0x55          /* distinct from the 0xAA handshake marker */
+#define READY_LINK_SILENCE_TIMEOUT (600L * BIOS_TICKS_TIMEOUT) /* only give up if the
+    link has been TOTALLY silent (no bytes at all, not even a stray one) this long -
+    that means the cable/link is actually dead, not just "still picking a team". */
+#define TEAM_SEND_MAX_RETRIES 5
+
+#define MOVE_WAIT_TIMEOUT (600L * BIOS_TICKS_TIMEOUT) /* ~10 minutes: waiting for the
+    OTHER player's move/next-fighter pick is bounded by how long a human takes to
+    decide, not by link health - a short timeout here (the old code used 5-10
+    SECONDS) means the wait fails almost every single turn as soon as either
+    player takes a normal amount of time to think. This should only ever fire if
+    the link is truly gone. */
 
 typedef struct {
     Character members[MAX_TEAM];
@@ -96,6 +115,112 @@ int load_character(const char* filename, Character* target) {
     }
 
     fclose(f);
+    return 1;
+}
+
+/* Writes a Character back out in the exact same layout load_character() reads,
+   so files this game saves can also be read by it (and vice versa with packer.py). */
+int save_character(const char* filename, Character* target) {
+    FILE *f;
+    ArchiveHeader header;
+    ArchiveEntry entry;
+    int i;
+    unsigned char temp_byte;
+
+    f = fopen(filename, "wb");
+    if (!f) return 0;
+
+    memcpy(header.magic, "CHAR", 4);
+    header.version = 1;
+    header.num_entries = 1;
+    fwrite(&header, sizeof(ArchiveHeader), 1, f);
+
+    memset(entry.name, 0, 16);
+    strncpy(entry.name, target->name, 15);
+    entry.offset = 28;
+    entry.size = 4096 + 56;
+    entry.type = 0;
+    entry.pad[0] = entry.pad[1] = entry.pad[2] = 0;
+    fwrite(&entry, sizeof(ArchiveEntry), 1, f);
+
+    fwrite(target->name, 16, 1, f);
+    fwrite(&target->max_hp, 4, 1, f); fwrite(&target->hp, 4, 1, f);
+    fwrite(&target->base_atk, 4, 1, f); fwrite(&target->base_def, 4, 1, f);
+    fwrite(&target->pad1, 4, 1, f); fwrite(&target->pad2, 4, 1, f);
+
+    for (i = 0; i < 4; i++) {
+        fwrite(target->moves[i].name, 16, 1, f);
+        fwrite(&target->moves[i].type, 4, 1, f);
+        fwrite(&target->moves[i].power, 4, 1, f);
+    }
+
+    /* Sprite lives in far memory; pull each byte through a near temp
+       (mirrors the far-memory-safe read pattern used in load_character). */
+    for (i = 0; i < 4096; i++) {
+        temp_byte = target->sprite_data ? target->sprite_data[i] : 16;
+        fwrite(&temp_byte, 1, 1, f);
+    }
+
+    fclose(f);
+    return 1;
+}
+
+#define LOADOUT_FILE "content\\loadout.sav"
+#define LOADOUT_MAGIC "LOUT"
+
+/* Remembers whatever the player picked in Customize (both teams + arena)
+   so they don't have to redo it every time they start the game. */
+void save_loadout(int* p1_idx, int p1_count, int* p2_idx, int p2_count, int bg_sel) {
+    FILE *f;
+
+    f = fopen(LOADOUT_FILE, "wb");
+    if (!f) return;
+
+    fwrite(LOADOUT_MAGIC, 4, 1, f);
+    fwrite(&p1_count, sizeof(int), 1, f);
+    fwrite(p1_idx, sizeof(int), MAX_TEAM, f);
+    fwrite(&p2_count, sizeof(int), 1, f);
+    fwrite(p2_idx, sizeof(int), MAX_TEAM, f);
+    fwrite(&bg_sel, sizeof(int), 1, f);
+
+    fclose(f);
+}
+
+/* Returns 1 and fills the outputs if a valid loadout was read, 0 otherwise.
+   Any index that no longer fits inside the current roster is dropped, so a
+   saved loadout never crashes the game if .chr files were added/removed. */
+int load_loadout(int* p1_idx, int* p1_count, int* p2_idx, int* p2_count, int* bg_sel, int roster_count) {
+    FILE *f;
+    char magic[4];
+    int i, w;
+
+    f = fopen(LOADOUT_FILE, "rb");
+    if (!f) return 0;
+
+    if (fread(magic, 4, 1, f) != 1 || strncmp(magic, LOADOUT_MAGIC, 4) != 0) { fclose(f); return 0; }
+
+    fread(p1_count, sizeof(int), 1, f);
+    fread(p1_idx, sizeof(int), MAX_TEAM, f);
+    fread(p2_count, sizeof(int), 1, f);
+    fread(p2_idx, sizeof(int), MAX_TEAM, f);
+    fread(bg_sel, sizeof(int), 1, f);
+    fclose(f);
+
+    /* Sanitize: compact out any index that doesn't exist in this roster */
+    w = 0;
+    for (i = 0; i < *p1_count && i < MAX_TEAM; i++) {
+        if (p1_idx[i] >= 0 && p1_idx[i] < roster_count) p1_idx[w++] = p1_idx[i];
+    }
+    *p1_count = w;
+
+    w = 0;
+    for (i = 0; i < *p2_count && i < MAX_TEAM; i++) {
+        if (p2_idx[i] >= 0 && p2_idx[i] < roster_count) p2_idx[w++] = p2_idx[i];
+    }
+    *p2_count = w;
+
+    if (*bg_sel < 0 || *bg_sel > 2) *bg_sel = 0;
+
     return 1;
 }
 
@@ -476,6 +601,403 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
     getch();
 }
 
+/* --- MULTIPLAYER (COM PORT) ---
+   Turn-based, so a simple polled/lockstep protocol over the serial link is
+   enough: both sides send their pick, then both wait for the other side's
+   pick, then both apply moves in the same fixed order (host first), so
+   the two machines' game states never diverge. */
+void net_send_character(int port, Character* c) {
+    int i;
+    unsigned char b;
+
+    serial_send_buffer(port, c->name, 16);
+    serial_send_buffer(port, &c->max_hp, 4);
+    serial_send_buffer(port, &c->hp, 4);
+    serial_send_buffer(port, &c->base_atk, 4);
+    serial_send_buffer(port, &c->base_def, 4);
+    serial_send_buffer(port, &c->pad1, 4);
+    serial_send_buffer(port, &c->pad2, 4);
+
+    for (i = 0; i < MAX_MOVES; i++) {
+        serial_send_buffer(port, c->moves[i].name, 16);
+        serial_send_buffer(port, &c->moves[i].type, 4);
+        serial_send_buffer(port, &c->moves[i].power, 4);
+    }
+
+    for (i = 0; i < 4096; i++) {
+        b = c->sprite_data ? c->sprite_data[i] : 16;
+        while (!serial_send_byte(port, b)) { /* retry */ }
+    }
+}
+
+int net_recv_character(int port, Character* c, long timeout_ticks) {
+    int i;
+    unsigned char b;
+
+    if (!serial_recv_buffer(port, c->name, 16, timeout_ticks)) return 0;
+    if (!serial_recv_buffer(port, &c->max_hp, 4, timeout_ticks)) return 0;
+    if (!serial_recv_buffer(port, &c->hp, 4, timeout_ticks)) return 0;
+    if (!serial_recv_buffer(port, &c->base_atk, 4, timeout_ticks)) return 0;
+    if (!serial_recv_buffer(port, &c->base_def, 4, timeout_ticks)) return 0;
+    if (!serial_recv_buffer(port, &c->pad1, 4, timeout_ticks)) return 0;
+    if (!serial_recv_buffer(port, &c->pad2, 4, timeout_ticks)) return 0;
+
+    for (i = 0; i < MAX_MOVES; i++) {
+        if (!serial_recv_buffer(port, c->moves[i].name, 16, timeout_ticks)) return 0;
+        if (!serial_recv_buffer(port, &c->moves[i].type, 4, timeout_ticks)) return 0;
+        if (!serial_recv_buffer(port, &c->moves[i].power, 4, timeout_ticks)) return 0;
+    }
+
+    c->sprite_data = (unsigned char far*)_fmalloc(4096);
+    for (i = 0; i < 4096; i++) {
+        if (!serial_recv_byte(port, &b, timeout_ticks)) return 0;
+        if (c->sprite_data) c->sprite_data[i] = b;
+    }
+    return 1;
+}
+
+void net_send_team(int port, Team* t) {
+    int i;
+    unsigned long chk;
+    serial_checksum_start();
+    net_send_int(port, t->count);
+    for (i = 0; i < t->count; i++) net_send_character(port, &t->members[i]);
+    chk = serial_checksum_value();
+    serial_send_buffer(port, &chk, sizeof(chk));
+}
+
+/* Returns 0 on timeout/link failure, 1 on success, -1 on a checksum
+   mismatch (bytes arrived but got scrambled/desynced somewhere - worth
+   a fresh retry rather than treating it the same as a dead link). */
+int net_recv_team(int port, Team* t, long timeout_ticks) {
+    int i;
+    unsigned long chk_theirs, chk_mine;
+
+    serial_checksum_start();
+    if (!net_recv_int(port, &t->count, timeout_ticks)) { serial_checksum_value(); return 0; }
+    if (t->count < 0 || t->count > MAX_TEAM) { serial_checksum_value(); return -1; }
+    for (i = 0; i < t->count; i++) {
+        if (!net_recv_character(port, &t->members[i], timeout_ticks)) { serial_checksum_value(); return 0; }
+    }
+    chk_mine = serial_checksum_value();
+    if (!serial_recv_buffer(port, &chk_theirs, sizeof(chk_theirs), timeout_ticks)) return 0;
+    if (chk_theirs != chk_mine) {
+        net_log("net_recv_team: checksum mismatch, data got scrambled");
+        return -1;
+    }
+    return 1;
+}
+
+/* Mutual "ready" rendezvous: keeps pinging a marker byte and watching for
+   the peer's own marker, so NEITHER side starts streaming the (large,
+   slow) team payload until it knows the other side has also finished
+   picking its team and is actually sitting in this loop listening.
+   This is what stops a fast player's data from racing ahead of a slower
+   player who is still on the team-select screen. Stays responsive the
+   whole time: screen text is refreshed, ESC still works, and it only
+   gives up if the link has gone completely silent for a long while
+   (a real dead cable), not just because the peer is still thinking. */
+int wait_for_peer_ready(int port) {
+    unsigned long last_activity;
+    unsigned char b;
+    long blink = 0;
+
+    serial_drain_rx(port);
+    last_activity = get_ticks();
+    for (;;) {
+        if (kbhit()) {
+            if (getch() == KEY_ESC) { net_log("team exchange: cancelled by user"); return 0; }
+        }
+        serial_send_byte(port, READY_BYTE);
+        if (serial_recv_byte(port, &b, 1)) {
+            last_activity = get_ticks();
+            if (b == READY_BYTE) return 1;
+            /* stray byte (old handshake retry, line noise, etc) - ignore, keep waiting */
+        }
+        if (get_ticks() - last_activity > READY_LINK_SILENCE_TIMEOUT) {
+            net_log("team exchange: link silent too long waiting for peer");
+            return 0;
+        }
+        blink++;
+        if (blink % 9 == 0) {
+            print_text(11, 5, (blink / 9) % 2 ? "(waiting on the other player if needed)   " :
+                                                  "(waiting on the other player if needed) . ", 7);
+        }
+    }
+}
+
+/* host_team/client_team are the same two structs on both machines; is_host
+   picks which one is "mine" for display and input, but combat is always
+   resolved host-first so both sides compute identical results. */
+void multiplayer_battle_scene(Team* host_team, Team* client_team, Background* bg, int port, int is_host) {
+    Team *my_team, *opp_team;
+    Character *pc, *ec;
+    char buffer[50], buffer2[50];
+    int move_idx;
+    int my_choice, opp_choice;
+    int next_idx;
+
+    host_team->active = team_next_alive(host_team, 0);
+    client_team->active = team_next_alive(client_team, 0);
+    my_team = is_host ? host_team : client_team;
+    opp_team = is_host ? client_team : host_team;
+
+    draw_full_battle(my_team, opp_team, bg);
+
+    while (team_alive_count(host_team) > 0 && team_alive_count(client_team) > 0) {
+        pc = &my_team->members[my_team->active];
+        ec = &opp_team->members[opp_team->active];
+
+        clear_ui_text();
+        sprintf(buffer, "%.15s HP:%-4ld", ec->name, ec->hp);
+        print_text(1, 1, buffer, 15);
+        sprintf(buffer, "%.15s HP:%-4ld", pc->name, pc->hp);
+        print_text(15, 20, buffer, 15);
+        print_text(19, 2, "Your move:", 14);
+
+        my_choice = -1;
+        while (my_choice < 0) {
+            move_idx = select_move(pc);
+            if (move_idx >= 0) my_choice = move_idx;
+        }
+
+        clear_ui_text();
+        print_text(19, 2, "Waiting for opponent...", 14);
+
+        net_send_int(port, my_choice);
+        if (!net_recv_int(port, &opp_choice, MOVE_WAIT_TIMEOUT)) {
+            print_text(22, 2, "Connection lost!", 12); getch(); return;
+        }
+
+        clear_ui_text();
+        if (is_host) {
+            resolve_move(&host_team->members[host_team->active], &host_team->members[host_team->active].moves[my_choice],
+                         &client_team->members[client_team->active], buffer, buffer2);
+        } else {
+            resolve_move(&host_team->members[host_team->active], &host_team->members[host_team->active].moves[opp_choice],
+                         &client_team->members[client_team->active], buffer, buffer2);
+        }
+        print_text(20, 2, buffer, 15); print_text(21, 2, buffer2, 15);
+        print_text(22, 2, "Press Key...", 14); getch();
+
+        if (client_team->members[client_team->active].hp <= 0 && team_alive_count(client_team) > 0) {
+            if (is_host) {
+                if (!net_recv_int(port, &next_idx, MOVE_WAIT_TIMEOUT)) {
+                    print_text(22, 2, "Connection lost!", 12); getch(); return;
+                }
+            } else {
+                next_idx = choose_next_character(client_team, "Your fighter fainted!");
+                net_send_int(port, next_idx);
+            }
+            client_team->active = next_idx;
+            clear_ui_text();
+            sprintf(buffer, "%.15s sent out!", client_team->members[client_team->active].name);
+            print_text(20, 2, buffer, 14);
+            print_text(22, 2, "Press Key...", 14); getch();
+        }
+
+        if (team_alive_count(client_team) > 0) {
+            clear_ui_text();
+            if (is_host) {
+                resolve_move(&client_team->members[client_team->active], &client_team->members[client_team->active].moves[opp_choice],
+                             &host_team->members[host_team->active], buffer, buffer2);
+            } else {
+                resolve_move(&client_team->members[client_team->active], &client_team->members[client_team->active].moves[my_choice],
+                             &host_team->members[host_team->active], buffer, buffer2);
+            }
+            print_text(20, 2, buffer, 12); print_text(21, 2, buffer2, 12);
+            print_text(22, 2, "Press Key...", 14); getch();
+
+            if (host_team->members[host_team->active].hp <= 0 && team_alive_count(host_team) > 0) {
+                if (is_host) {
+                    next_idx = choose_next_character(host_team, "Your fighter fainted!");
+                    net_send_int(port, next_idx);
+                } else {
+                    if (!net_recv_int(port, &next_idx, MOVE_WAIT_TIMEOUT)) {
+                        print_text(22, 2, "Connection lost!", 12); getch(); return;
+                    }
+                }
+                host_team->active = next_idx;
+                clear_ui_text();
+                sprintf(buffer, "%.15s sent out!", host_team->members[host_team->active].name);
+                print_text(20, 2, buffer, 14);
+                print_text(22, 2, "Press Key...", 14); getch();
+            }
+        }
+
+        draw_full_battle(my_team, opp_team, bg);
+    }
+
+    clear_ui_text();
+    sprintf(buffer, "%s Wins!", team_alive_count(my_team) > 0 ? "You" : "Opponent");
+    print_text(20, 4, buffer, 14);
+    print_text(22, 4, "Press any key...", 7);
+    getch();
+}
+
+/* Handles the whole "Multiplayer" flow: pick Host/Join, pick a COM port,
+   handshake over the wire, exchange team data, then run the battle. */
+void multiplayer_menu(char roster[][64], char display_names[][16], int roster_count) {
+    int key, sel, port, done;
+    int is_host;
+    unsigned char hb;
+    static Team host_team, client_team;
+    static int my_idx[MAX_TEAM];
+    int my_count;
+    Background bg;
+    char buffer[64];
+    int i;
+    long handshake_tries;
+
+    if (roster_count == 0) {
+        draw_rect(0, 0, 320, 200, 0);
+        print_text(10, 5, "Error: No .chr files found!", 12); getch(); return;
+    }
+
+    /* Host or Join */
+    sel = 1; done = 0;
+    while (!done) {
+        draw_rect(0, 0, 320, 200, 0);
+        print_text(4, 8, "--- MULTIPLAYER (COM PORT) ---", 14);
+        print_text(8, 10, "1. Host Game", sel == 1 ? 15 : 7);
+        print_text(10, 10, "2. Join Game", sel == 2 ? 15 : 7);
+        print_text(12, 10, "3. Back", sel == 3 ? 15 : 7);
+        key = read_key();
+        if (key == '1') sel = 1;
+        if (key == '2') sel = 2;
+        if (key == '3') sel = 3;
+        if (key == KEY_UP) { sel--; if (sel < 1) sel = 3; }
+        if (key == KEY_DOWN) { sel++; if (sel > 3) sel = 1; }
+        if (key == KEY_ESC) return;
+        if (key == KEY_ENTER) done = 1;
+    }
+    if (sel == 3) return;
+    is_host = (sel == 1);
+
+    /* Choose COM port */
+    port = 1; done = 0;
+    while (!done) {
+        draw_rect(0, 0, 320, 200, 0);
+        print_text(6, 8, "Which COM port? (null-modem cable)", 14);
+        sprintf(buffer, "1. COM1"); print_text(9, 10, buffer, port == 1 ? 15 : 7);
+        sprintf(buffer, "2. COM2"); print_text(11, 10, buffer, port == 2 ? 15 : 7);
+        print_text(14, 10, "ENTER: continue  ESC: back", 7);
+        key = read_key();
+        if (key == '1') port = 1;
+        if (key == '2') port = 2;
+        if (key == KEY_UP || key == KEY_DOWN) port = (port == 1) ? 2 : 1;
+        if (key == KEY_ESC) return;
+        if (key == KEY_ENTER) done = 1;
+    }
+
+    serial_init(port, 9600);
+    serial_drain_rx(port);
+    net_log(is_host ? "multiplayer_menu: role=HOST" : "multiplayer_menu: role=CLIENT");
+
+    /* Handshake: keep exchanging a marker byte until both sides see it,
+       ESC cancels. This also drains any garbage left on the line. */
+    draw_rect(0, 0, 320, 200, 0);
+    print_text(10, 5, is_host ? "Waiting for other player..." : "Connecting to host...", 14);
+    print_text(12, 5, "(ESC to cancel)", 7);
+    handshake_tries = 0;
+    for (;;) {
+        if (kbhit()) { if (getch() == KEY_ESC) { net_log("handshake: cancelled by user"); serial_close(port); return; } }
+        serial_send_byte(port, 0xAA);
+        if (serial_recv_byte(port, &hb, 1) && hb == 0xAA) break;
+        handshake_tries++;
+        if (handshake_tries % 200 == 0) {
+            sprintf(buffer, "handshake: still trying (%ld attempts, no 0xAA echoed back)", handshake_tries);
+            net_log(buffer);
+        }
+    }
+    sprintf(buffer, "handshake: connected after %ld attempts", handshake_tries);
+    net_log(buffer);
+    print_text(14, 5, "Connected!", 10);
+    print_text(15, 5, "Press any key...", 7); getch();
+
+    /* Pick my own team locally */
+    my_count = select_team(display_names, roster_count, my_idx, "SELECT YOUR TEAM (up to 4)");
+    if (my_count == 0) { net_log("multiplayer_menu: no team picked, aborting"); serial_close(port); return; }
+
+    if (is_host) {
+        host_team.count = my_count;
+        for (i = 0; i < my_count; i++) load_character(roster[my_idx[i]], &host_team.members[i]);
+    } else {
+        client_team.count = my_count;
+        for (i = 0; i < my_count; i++) load_character(roster[my_idx[i]], &client_team.members[i]);
+    }
+
+    draw_rect(0, 0, 320, 200, 0);
+    print_text(10, 5, "Exchanging team data...", 14);
+    print_text(11, 5, "(waiting on the other player if needed)", 7);
+    print_text(13, 5, "(ESC to cancel)", 7);
+    net_log("multiplayer_menu: starting team exchange");
+
+    /* Don't let either side start streaming its team until BOTH sides have
+       actually finished picking and are here listening - this is what used
+       to race: whoever picked faster would dump its team while the other
+       was still on the select-team screen, which could desync the link and
+       show "Connection lost" even though nothing was really wrong yet. */
+    if (!wait_for_peer_ready(port)) {
+        print_text(12, 5, "Connection cancelled.", 12); getch(); serial_close(port); return;
+    }
+
+    {
+        int attempt, ok;
+        long recv_timeout;
+
+        for (attempt = 1; attempt <= TEAM_SEND_MAX_RETRIES; attempt++) {
+            sprintf(buffer, "team exchange: attempt %d of %d", attempt, TEAM_SEND_MAX_RETRIES);
+            net_log(buffer);
+            /* Give it plenty of time on the first try (still nothing but a
+               link problem could explain a stall here now), then shorter
+               once we know we might need to just retry the framed send. */
+            recv_timeout = (attempt == 1) ? TEAM_EXCHANGE_TIMEOUT : 10L * BIOS_TICKS_TIMEOUT;
+
+            /* Fixed order avoids both sides trying to send at once: host sends first. */
+            if (is_host) {
+                net_log("team exchange: sending host team");
+                net_send_team(port, &host_team);
+                net_log("team exchange: waiting to receive client team");
+                ok = net_recv_team(port, &client_team, recv_timeout);
+            } else {
+                net_log("team exchange: waiting to receive host team");
+                ok = net_recv_team(port, &host_team, recv_timeout);
+                if (ok == 1) {
+                    net_log("team exchange: sending client team");
+                    net_send_team(port, &client_team);
+                }
+            }
+
+            if (ok == 1) break;
+
+            if (ok == 0) {
+                net_log("team exchange: TIMED OUT / link problem");
+                print_text(12, 5, "Connection lost.", 12); getch(); serial_close(port); return;
+            }
+
+            /* ok == -1: bytes arrived scrambled/out of sync - resync and retry
+               rather than giving up outright. */
+            net_log("team exchange: retrying after scrambled data");
+            print_text(12, 5, "Hiccup - retrying...       ", 12);
+            if (attempt == TEAM_SEND_MAX_RETRIES) {
+                print_text(12, 5, "Connection lost.", 12); getch(); serial_close(port); return;
+            }
+            if (!wait_for_peer_ready(port)) {
+                print_text(12, 5, "Connection cancelled.", 12); getch(); serial_close(port); return;
+            }
+        }
+    }
+    load_core_bg(0, &bg);
+    net_log("team exchange: complete, entering battle");
+
+    multiplayer_battle_scene(&host_team, &client_team, &bg, port, is_host);
+
+    for (i = 0; i < host_team.count; i++) if (host_team.members[i].sprite_data) _ffree(host_team.members[i].sprite_data);
+    for (i = 0; i < client_team.count; i++) if (client_team.members[i].sprite_data) _ffree(client_team.members[i].sprite_data);
+    serial_close(port);
+}
+
 int main() {
     /* ALL variables declared at the top of the block! (Strict C89) */
     int running, selection, bg_sel;
@@ -526,21 +1048,28 @@ int main() {
         p2_count = 1;
     }
 
+    /* If the player saved a loadout last time, use it instead of the defaults above */
+    load_loadout(p1_idx, &p1_count, p2_idx, &p2_count, &bg_sel, roster_count);
+    if (roster_count > 0 && p1_count == 0) { p1_idx[0] = 0; p1_count = 1; }
+    if (roster_count > 0 && p2_count == 0) { p2_idx[0] = (roster_count > 1) ? 1 : 0; p2_count = 1; }
+
     set_video_mode(0x13);
 
     while (running) {
         draw_rect(0, 0, 320, 200, 0);
         print_text(5, 14, "DOSTCG", 14);
         print_text(11, 12, "1. Play Game", selection == 1 ? 15 : 7);
-        print_text(13, 12, "2. Customize", selection == 2 ? 15 : 7);
-        print_text(15, 12, "3. Exit", selection == 3 ? 15 : 7);
+        print_text(13, 12, "2. Multiplayer (COM)", selection == 2 ? 15 : 7);
+        print_text(15, 12, "3. Customize", selection == 3 ? 15 : 7);
+        print_text(17, 12, "4. Exit", selection == 4 ? 15 : 7);
 
         key = read_key();
         if (key == '1') selection = 1;
         if (key == '2') selection = 2;
         if (key == '3') selection = 3;
-        if (key == KEY_UP) { selection--; if (selection < 1) selection = 3; }
-        if (key == KEY_DOWN) { selection++; if (selection > 3) selection = 1; }
+        if (key == '4') selection = 4;
+        if (key == KEY_UP) { selection--; if (selection < 1) selection = 4; }
+        if (key == KEY_DOWN) { selection++; if (selection > 4) selection = 1; }
 
         if (key == KEY_ENTER) {
             if (selection == 1) {
@@ -568,6 +1097,9 @@ int main() {
                     if (p2team.members[i].sprite_data) _ffree(p2team.members[i].sprite_data);
             }
             else if (selection == 2) {
+                multiplayer_menu(roster, display_names, roster_count);
+            }
+            else if (selection == 3) {
                 cust_menu = 1;
                 cust_cursor = 1;
                 while (cust_menu) {
@@ -612,10 +1144,15 @@ int main() {
                         } else if (cust_cursor == 3) {
                             bg_sel = (bg_sel + 1) % 3;
                         }
+                        save_loadout(p1_idx, p1_count, p2_idx, p2_count, bg_sel);
+                    }
+
+                    if (key == KEY_ESC) {
+                        save_loadout(p1_idx, p1_count, p2_idx, p2_count, bg_sel);
                     }
                 }
             }
-            else if (selection == 3) { running = 0; }
+            else if (selection == 4) { running = 0; }
         }
     }
     set_video_mode(0x03);

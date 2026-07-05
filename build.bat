@@ -16,10 +16,12 @@ echo Compiling C code...
 if errorlevel 1 goto error
 "%WATCOM%\binnt\wcc.exe" vga.c -mm -I"%WATCOM%\h"
 if errorlevel 1 goto error
+"%WATCOM%\binnt\wcc.exe" serial.c -mm -I"%WATCOM%\h"
+if errorlevel 1 goto error
 
 echo.
 echo Linking game.exe...
-"%WATCOM%\binnt\wlink.exe" system dos name game.exe file main.obj file vga.obj libpath "%WATCOM%\lib286\dos" libpath "%WATCOM%\lib286" library clibm.lib option stack=8192
+"%WATCOM%\binnt\wlink.exe" system dos name game.exe file main.obj file vga.obj file serial.obj libpath "%WATCOM%\lib286\dos" libpath "%WATCOM%\lib286" library clibm.lib option stack=8192
 if errorlevel 1 goto error
 exit /b
 
