@@ -997,13 +997,46 @@ void multiplayer_menu(char roster[][64], char display_names[][16], int roster_co
     print_text(13, 5, "(ESC to cancel)", 7);
     net_log("multiplayer_menu: starting team exchange");
 
-    /* Don't let either side start streaming its team until BOTH sides have
-       actually finished picking and are here listening - this is what used
-       to race: whoever picked faster would dump its team while the other
-       was still on the select-team screen, which could desync the link and
-       show "Connection lost" even though nothing was really wrong yet. */
-    if (!wait_for_peer_ready(port)) {
-        print_text(12, 5, "Connection cancelled.", 12); getch(); serial_close(port); return;
+    {
+        int peer_ready = 0;
+        unsigned char b;
+        long blink = 0;
+        serial_drain_rx(port);
+        
+        while (!peer_ready) {
+            /* Keep UI responsive so players can still back out */
+            if (kbhit() && getch() == KEY_ESC) {
+                print_text(12, 5, "Connection cancelled.", 12); 
+                getch(); 
+                serial_close(port); 
+                return;
+            }
+            
+            if (is_host) {
+                /* Host sits passively and listens for the Client's readiness byte */
+                if (serial_recv_byte(port, &b, 1) && b == 0x56) {
+                    serial_send_byte(port, 0x57); /* Send ACK to Client */
+                    peer_ready = 1;
+                    delay(50); /* Tiny pause so Client finishes the loop before Host blasts 16KB of data */
+                }
+            } else {
+                /* Client is ready. Continuously ping the Host until acknowledged. */
+                serial_send_byte(port, 0x56);
+                if (serial_recv_byte(port, &b, 1) && b == 0x57) {
+                    peer_ready = 1;
+                }
+            }
+            
+            /* Maintain the visual "thinking" indicator */
+            blink++;
+            if (blink % 9 == 0) {
+                print_text(11, 5, (blink / 9) % 2 ? "(waiting on the other player if needed)   " :
+                                                    "(waiting on the other player if needed) . ", 7);
+            }
+        }
+        
+        /* Flush out any lingering handshake bytes before binary transfer begins */
+        serial_drain_rx(port); 
     }
 
     {
