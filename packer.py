@@ -31,6 +31,17 @@ EGA_PALETTE = [
 ]
 
 
+# Must match the TYPE_* constants in types.h (Character.elem_type)
+CHAR_TYPES = {
+    "NORMAL": 0,
+    "FIRE": 1,
+    "WATER": 2,
+    "GRASS": 3,
+    "EARTH": 4,
+    "ELECTRIC": 5,
+}
+
+
 def _nearest_ega_index(rgb):
     r, g, b = rgb
     best_i, best_d = 0, None
@@ -91,6 +102,7 @@ def pack_character(char_folder, output_file):
     raw_name = os.path.basename(char_folder).encode('ascii')[:15]
     name = raw_name.ljust(16, b'\0')
     max_hp, hp, base_atk, base_def = 100, 100, 10, 10
+    elem_type = CHAR_TYPES["NORMAL"]
 
     if os.path.exists(stats_path):
         with open(stats_path, 'r') as f:
@@ -100,6 +112,11 @@ def pack_character(char_folder, output_file):
                     if k == 'MAX_HP': max_hp = hp = int(v)
                     if k == 'BASE_ATK': base_atk = int(v)
                     if k == 'BASE_DEF': base_def = int(v)
+                    if k == 'TYPE':
+                        v = v.strip().upper()
+                        if v not in CHAR_TYPES:
+                            print(f"  Warning: unknown TYPE '{v}' in {stats_path}, defaulting to NORMAL")
+                        elem_type = CHAR_TYPES.get(v, CHAR_TYPES["NORMAL"])
 
     moves = []
     if os.path.exists(moves_path):
@@ -124,7 +141,9 @@ def pack_character(char_folder, output_file):
         f.write(struct.pack('<B', 0))
         f.write(b'\0'*3)
         f.write(name)
-        f.write(struct.pack('<iiiiii', max_hp, hp, base_atk, base_def, 0, 0))
+        # Field order matches Character in types.h: max_hp, hp, base_atk,
+        # base_def, elem_type, pad2 (pad2 stays reserved/0).
+        f.write(struct.pack('<iiiiii', max_hp, hp, base_atk, base_def, elem_type, 0))
         for m in moves[:4]:
             f.write(m[0])
             f.write(struct.pack('<ii', m[1], m[2]))
@@ -159,3 +178,4 @@ if __name__ == "__main__":
                 pack_character(char_path, f"content/{item}.chr")
     pack_core()
     print("Done! All files generated in ./content")
+    

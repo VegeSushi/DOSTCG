@@ -28,14 +28,28 @@ typedef struct {
     int32_t power;
 } Move;
 
+/* Elemental character types (Pokemon-style). Values are stored in the
+   Character.elem_type field below and are what drives the weakness /
+   resistance multiplier table in main.c (get_type_multiplier). */
+#define TYPE_NORMAL   0
+#define TYPE_FIRE     1
+#define TYPE_WATER    2
+#define TYPE_GRASS    3
+#define TYPE_EARTH    4
+#define TYPE_ELECTRIC 5
+#define NUM_TYPES     6
+
 typedef struct {
     char name[16];
     int32_t max_hp;
     int32_t hp;
     int32_t base_atk;
     int32_t base_def;
-    int32_t pad1; 
-    int32_t pad2;
+    int32_t elem_type; /* one of the TYPE_* constants above. Was "pad1";
+                          renamed/repurposed so the on-disk .chr layout,
+                          the network wire format, and save_character()'s
+                          byte order are all unchanged. */
+    int32_t pad2;      /* still reserved/unused */
     Move moves[4];
     unsigned char far* sprite_data;
 } Character;

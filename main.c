@@ -96,7 +96,7 @@ int load_character(const char* filename, Character* target) {
     if (target->hp > target->max_hp) target->hp = target->max_hp;
     if (target->hp < 0) target->hp = 0;
     fread(&target->base_atk, 4, 1, f); fread(&target->base_def, 4, 1, f);
-    fread(&target->pad1, 4, 1, f); fread(&target->pad2, 4, 1, f);
+    fread(&target->elem_type, 4, 1, f); fread(&target->pad2, 4, 1, f);
 
     for (i = 0; i < 4; i++) {
         fread(target->moves[i].name, 16, 1, f);
@@ -146,7 +146,7 @@ int save_character(const char* filename, Character* target) {
     fwrite(target->name, 16, 1, f);
     fwrite(&target->max_hp, 4, 1, f); fwrite(&target->hp, 4, 1, f);
     fwrite(&target->base_atk, 4, 1, f); fwrite(&target->base_def, 4, 1, f);
-    fwrite(&target->pad1, 4, 1, f); fwrite(&target->pad2, 4, 1, f);
+    fwrite(&target->elem_type, 4, 1, f); fwrite(&target->pad2, 4, 1, f);
 
     for (i = 0; i < 4; i++) {
         fwrite(target->moves[i].name, 16, 1, f);
@@ -268,6 +268,40 @@ int count_valid_moves(Character* c) {
     n = 0;
     for (i = 0; i < MAX_MOVES; i++) if (move_is_valid(&c->moves[i])) n++;
     return n;
+}
+
+/* --- ELEMENTAL TYPES (Pokemon-style weakness/resistance) ---
+   Table entries are the attacker's damage multiplier, scaled by 10 so we
+   can stay in integer math on 16-bit DOS (20 = 2.0x super effective,
+   5 = 0.5x resisted, 10 = 1.0x neutral). Row = attacker type,
+   column = defender type. NORMAL is neutral against, and neutral to,
+   everything, matching a plain character with no elemental edge. */
+static const int TYPE_CHART[NUM_TYPES][NUM_TYPES] = {
+    /*              NORMAL FIRE WATER GRASS EARTH ELEC */
+    /* NORMAL   */ { 10,   10,  10,   10,   10,   10 },
+    /* FIRE     */ { 10,   10,  5,    20,   5,    10 },
+    /* WATER    */ { 10,   20,  10,   5,    20,    5 },
+    /* GRASS    */ { 10,   5,   20,   10,   20,   10 },
+    /* EARTH    */ { 10,   20,  5,    5,    10,   20 },
+    /* ELECTRIC */ { 10,   10,  20,   10,   5,    10 }
+};
+
+const char* TYPE_NAMES[NUM_TYPES] = {
+    "Normal", "Fire", "Water", "Grass", "Earth", "Electric"
+};
+
+const char* type_name(int t) {
+    if (t < 0 || t >= NUM_TYPES) return "Normal";
+    return TYPE_NAMES[t];
+}
+
+/* Returns the x10-scaled multiplier for an attacker's type against a
+   defender's type. Out-of-range types are treated as Normal (neutral),
+   which keeps old/garbled .chr files from crashing the table lookup. */
+int get_type_multiplier(int attacker_type, int defender_type) {
+    if (attacker_type < 0 || attacker_type >= NUM_TYPES) attacker_type = TYPE_NORMAL;
+    if (defender_type < 0 || defender_type >= NUM_TYPES) defender_type = TYPE_NORMAL;
+    return TYPE_CHART[attacker_type][defender_type];
 }
 
 /* Player move-select screen. Returns move index (0..3), or -1 if cancelled. */
@@ -399,7 +433,7 @@ int choose_next_character(Team* t, const char* label) {
     int i;
     int done;
     int chosen;
-    char buffer[48];
+    char buffer[64];
 
     cursor = 0;
     for (i = 0; i < t->count; i++) { if (t->members[i].hp > 0) { cursor = i; break; } }
@@ -413,10 +447,10 @@ int choose_next_character(Team* t, const char* label) {
 
         for (i = 0; i < t->count; i++) {
             if (t->members[i].hp <= 0) {
-                sprintf(buffer, "%d. %.15s (FAINTED)", i + 1, t->members[i].name);
+                sprintf(buffer, "%d. %.15s [%s] (FAINTED)", i + 1, t->members[i].name, type_name(t->members[i].elem_type));
                 print_text(6 + i, 4, buffer, 8);
             } else {
-                sprintf(buffer, "%d. %.15s HP:%ld", i + 1, t->members[i].name, t->members[i].hp);
+                sprintf(buffer, "%d. %.15s [%s] HP:%ld", i + 1, t->members[i].name, type_name(t->members[i].elem_type), t->members[i].hp);
                 print_text(6 + i, 4, buffer, (cursor == i) ? 15 : 7);
             }
         }
@@ -450,7 +484,11 @@ void draw_full_battle(Team* p1, Team* p2, Background* bg) {
    and healing the target instead of hurting it. */
 long compute_damage(Character* attacker, Move* move, Character* defender) {
     long dmg;
+    int mult;
     dmg = (attacker->base_atk + move->power) - defender->base_def;
+    if (dmg < 1) dmg = 1;
+    mult = get_type_multiplier(attacker->elem_type, defender->elem_type);
+    dmg = (dmg * mult) / 10L; /* mult is x10-scaled (20=2x, 5=0.5x, 10=1x) */
     if (dmg < 1) dmg = 1;
     if (dmg > 9999) dmg = 9999; /* defensive cap: guards against overflowed/corrupt stats */
     return dmg;
@@ -459,7 +497,7 @@ long compute_damage(Character* attacker, Move* move, Character* defender) {
 /* Move types: 0=Attack, 1=Heal, 2=Buff_Atk, 3=Debuff_Def.
    Applies the move's effect (damage/heal/stat change) and writes two lines
    of battle text: line1 is the "X uses Y!" announcement, line2 describes
-   what happened as a result. Both buffers should be at least 50 bytes. */
+   what happened as a result. Both buffers should be at least 64 bytes. */
 void resolve_move(Character* attacker, Move* move, Character* defender, char* line1, char* line2) {
     long dmg, amt;
 
@@ -471,7 +509,12 @@ void resolve_move(Character* attacker, Move* move, Character* defender, char* li
             defender->hp -= dmg;
             if (defender->hp < 0) defender->hp = 0;
             if (defender->hp > defender->max_hp) defender->hp = defender->max_hp;
-            sprintf(line2, "%.15s takes %ld damage!", defender->name, dmg);
+            {
+                int mult = get_type_multiplier(attacker->elem_type, defender->elem_type);
+                const char* fx = (mult > 10) ? " It's super effective!" :
+                                 (mult < 10) ? " It's not very effective..." : "";
+                sprintf(line2, "%.15s takes %ld dmg!%s", defender->name, dmg, fx);
+            }
             break;
 
         case 1: /* Heal */
@@ -502,8 +545,8 @@ void resolve_move(Character* attacker, Move* move, Character* defender, char* li
 }
 
 void battle_scene(Team* p1, Team* p2, Background* bg) {
-    char buffer[50];
-    char buffer2[50];
+    char buffer[64];
+    char buffer2[64];
     int action;
     int key;
     Character* pc;
@@ -523,12 +566,12 @@ void battle_scene(Team* p1, Team* p2, Background* bg) {
 
         clear_ui_text();
         /* Enemy HP Update */
-        sprintf(buffer, "%.15s HP:%-4ld", ec->name, ec->hp);
+        sprintf(buffer, "%.15s [%s] HP:%-4ld", ec->name, type_name(ec->elem_type), ec->hp);
         print_text(1, 1, buffer, 15);
 
         /* Player HP Update */
-        sprintf(buffer, "%.15s HP:%-4ld", pc->name, pc->hp);
-        print_text(15, 20, buffer, 15);
+        sprintf(buffer, "%.15s [%s] HP:%-4ld", pc->name, type_name(pc->elem_type), pc->hp);
+        print_text(15, 15, buffer, 15);
 
         print_text(19, 2, "Action:", 14);
         print_text(21, 4, "1. Atk", action == 1 ? 15 : 7);
@@ -615,7 +658,7 @@ void net_send_character(int port, Character* c) {
     serial_send_buffer(port, &c->hp, 4);
     serial_send_buffer(port, &c->base_atk, 4);
     serial_send_buffer(port, &c->base_def, 4);
-    serial_send_buffer(port, &c->pad1, 4);
+    serial_send_buffer(port, &c->elem_type, 4);
     serial_send_buffer(port, &c->pad2, 4);
 
     for (i = 0; i < MAX_MOVES; i++) {
@@ -639,7 +682,7 @@ int net_recv_character(int port, Character* c, long timeout_ticks) {
     if (!serial_recv_buffer(port, &c->hp, 4, timeout_ticks)) return 0;
     if (!serial_recv_buffer(port, &c->base_atk, 4, timeout_ticks)) return 0;
     if (!serial_recv_buffer(port, &c->base_def, 4, timeout_ticks)) return 0;
-    if (!serial_recv_buffer(port, &c->pad1, 4, timeout_ticks)) return 0;
+    if (!serial_recv_buffer(port, &c->elem_type, 4, timeout_ticks)) return 0;
     if (!serial_recv_buffer(port, &c->pad2, 4, timeout_ticks)) return 0;
 
     for (i = 0; i < MAX_MOVES; i++) {
@@ -796,7 +839,7 @@ int wait_for_peer_ready(int port) {
 void multiplayer_battle_scene(Team* host_team, Team* client_team, Background* bg, int port, int is_host) {
     Team *my_team, *opp_team;
     Character *pc, *ec;
-    char buffer[50], buffer2[50];
+    char buffer[64], buffer2[64];
     int move_idx;
     int my_choice, opp_choice;
     int next_idx;
@@ -813,10 +856,10 @@ void multiplayer_battle_scene(Team* host_team, Team* client_team, Background* bg
         ec = &opp_team->members[opp_team->active];
 
         clear_ui_text();
-        sprintf(buffer, "%.15s HP:%-4ld", ec->name, ec->hp);
+        sprintf(buffer, "%.15s [%s] HP:%-4ld", ec->name, type_name(ec->elem_type), ec->hp);
         print_text(1, 1, buffer, 15);
-        sprintf(buffer, "%.15s HP:%-4ld", pc->name, pc->hp);
-        print_text(15, 20, buffer, 15);
+        sprintf(buffer, "%.15s [%s] HP:%-4ld", pc->name, type_name(pc->elem_type), pc->hp);
+        print_text(15, 15, buffer, 15);
         print_text(19, 2, "Your move:", 14);
 
         my_choice = -1;
