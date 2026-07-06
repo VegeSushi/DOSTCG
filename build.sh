@@ -22,9 +22,9 @@ echo "Cleaning old files..."
 rm -f *.obj game.exe
 
 echo "Compiling C code..."
-wcc main.c -mm -I"$WATCOM/h"
-wcc vga.c -mm -I"$WATCOM/h"
-wcc serial.c -mm -I"$WATCOM/h"
+wcc main.c -mm -I"$WATCOM/h" -fo=main.obj
+wcc vga.c -mm -I"$WATCOM/h" -fo=vga.obj
+wcc serial.c -mm -I"$WATCOM/h" -fo=serial.obj
 
 echo "Linking game.exe..."
 wlink system dos name game.exe file main.obj file vga.obj file serial.obj libpath "$WATCOM/lib286/dos" libpath "$WATCOM/lib286" library clibm.lib option stack=8192
