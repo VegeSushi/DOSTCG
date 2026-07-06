@@ -1,4 +1,4 @@
-name: Build DOS Game
+name: Build and Release DOS Game
 
 on:
   push:
@@ -9,6 +9,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    
+    # We need to explicitly grant write permissions so the workflow can create a release
+    permissions:
+      contents: write
 
     steps:
     - name: Checkout Repository
@@ -40,10 +44,27 @@ jobs:
         chmod +x build.sh
         ./build.sh
 
-    - name: Upload Playable Artifact
-      uses: actions/upload-artifact@v4
+    - name: Get Current Date and Time
+      id: datetime
+      # Formats date as DDMMYYYY-HHMM and saves it to the environment
+      run: echo "TIMESTAMP=$(date +'%d%m%Y-%H%M')" >> $GITHUB_ENV
+
+    - name: Zip Files for Release
+      run: |
+        echo "Zipping game.exe and content/..."
+        zip -r DOSTCG-${{ env.TIMESTAMP }}.zip game.exe content/
+
+    - name: Create GitHub Release
+      # Only create a release when code is pushed/merged to main, not on PRs
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v2
       with:
-        name: DOSTCG-Release
-        path: |
-          game.exe
-          content/
+        tag_name: v${{ env.TIMESTAMP }}
+        name: Release ${{ env.TIMESTAMP }}
+        files: DOSTCG-${{ env.TIMESTAMP }}.zip
+        body: |
+          Automated build generated on push to main.
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
