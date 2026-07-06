@@ -426,6 +426,75 @@ int select_team(char display_names[][16], int roster_count, int* chosen, const c
     return count;
 }
 
+/* --- DEX SCREEN ---
+   Lets the player browse every .chr file currently installed in /content,
+   showing name, type, stats, moves, and the sprite. Loads one character at
+   a time (freeing the previous far-memory sprite first) so browsing a big
+   roster never leaks or exhausts far memory. */
+void show_dex(char roster[][64], char display_names[][16], int roster_count) {
+    int idx, key, done;
+    int i, moves_shown;
+    Character c;
+    char buffer[48];
+
+    if (roster_count == 0) {
+        draw_rect(0, 0, 320, 200, 0);
+        print_text(10, 3, "No characters found in /content!", 12);
+        print_text(12, 3, "Press any key to go back.", 7);
+        getch();
+        return;
+    }
+
+    idx = 0;
+    done = 0;
+    c.sprite_data = NULL;
+
+    while (!done) {
+        if (c.sprite_data) { _ffree(c.sprite_data); c.sprite_data = NULL; }
+
+        if (!load_character(roster[idx], &c)) {
+            draw_rect(0, 0, 320, 200, 0);
+            print_text(10, 3, "Error loading character file!", 12);
+            print_text(12, 3, "Press any key to go back.", 7);
+            getch();
+            return;
+        }
+
+        draw_rect(0, 0, 320, 200, 0);
+        sprintf(buffer, "DEX %d/%d", idx + 1, roster_count);
+        print_text(1, 2, buffer, 14);
+        print_text(1, 16, display_names[idx], 15);
+
+        if (c.sprite_data) draw_sprite(128, 12, c.sprite_data);
+
+        sprintf(buffer, "Type: %s", type_name(c.elem_type));
+        print_text(11, 3, buffer, 11);
+        sprintf(buffer, "HP:  %ld/%ld", c.hp, c.max_hp);
+        print_text(12, 3, buffer, 10);
+        sprintf(buffer, "ATK: %ld   DEF: %ld", c.base_atk, c.base_def);
+        print_text(13, 3, buffer, 10);
+
+        print_text(15, 3, "Moves:", 14);
+        moves_shown = 0;
+        for (i = 0; i < MAX_MOVES; i++) {
+            if (!move_is_valid(&c.moves[i])) continue;
+            sprintf(buffer, "- %.15s (%s, PWR %ld)", c.moves[i].name, type_name(c.moves[i].type), c.moves[i].power);
+            print_text(16 + moves_shown, 4, buffer, 7);
+            moves_shown++;
+        }
+        if (moves_shown == 0) print_text(16, 4, "- (none)", 7);
+
+        print_text(23, 2, "Left/Right: browse   ESC: back", 8);
+
+        key = read_key();
+        if (key == KEY_LEFT || key == KEY_UP) { idx--; if (idx < 0) idx = roster_count - 1; }
+        if (key == KEY_RIGHT || key == KEY_DOWN) { idx++; if (idx >= roster_count) idx = 0; }
+        if (key == KEY_ESC) done = 1;
+    }
+
+    if (c.sprite_data) _ffree(c.sprite_data);
+}
+
 /* --- BATTLE-TIME "CHOOSE NEXT FIGHTER" SCREEN --- */
 int choose_next_character(Team* t, const char* label) {
     int cursor;
@@ -1193,15 +1262,17 @@ int main() {
         print_text(11, 12, "1. Play Game", selection == 1 ? 15 : 7);
         print_text(13, 12, "2. Multiplayer (COM)", selection == 2 ? 15 : 7);
         print_text(15, 12, "3. Customize", selection == 3 ? 15 : 7);
-        print_text(17, 12, "4. Exit", selection == 4 ? 15 : 7);
+        print_text(17, 12, "4. Dex", selection == 4 ? 15 : 7);
+        print_text(19, 12, "5. Exit", selection == 5 ? 15 : 7);
 
         key = read_key();
         if (key == '1') selection = 1;
         if (key == '2') selection = 2;
         if (key == '3') selection = 3;
         if (key == '4') selection = 4;
-        if (key == KEY_UP) { selection--; if (selection < 1) selection = 4; }
-        if (key == KEY_DOWN) { selection++; if (selection > 4) selection = 1; }
+        if (key == '5') selection = 5;
+        if (key == KEY_UP) { selection--; if (selection < 1) selection = 5; }
+        if (key == KEY_DOWN) { selection++; if (selection > 5) selection = 1; }
 
         if (key == KEY_ENTER) {
             if (selection == 1) {
@@ -1284,7 +1355,10 @@ int main() {
                     }
                 }
             }
-            else if (selection == 4) { running = 0; }
+            else if (selection == 4) {
+                show_dex(roster, display_names, roster_count);
+            }
+            else if (selection == 5) { running = 0; }
         }
     }
     set_video_mode(0x03);
