@@ -1,0 +1,49 @@
+name: Build DOS Game
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pillow
+
+    - name: Pack Game Assets
+      run: |
+        echo "Running packer.py to generate /content directory..."
+        python packer.py
+
+    - name: Setup Open Watcom V2
+      uses: open-watcom/setup-watcom@v1
+      with:
+        version: "2.0"
+        target: "dos"
+
+    - name: Build Game (game.exe)
+      run: |
+        chmod +x build.sh
+        ./build.sh
+
+    - name: Upload Playable Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: DOSTCG-Release
+        path: |
+          game.exe
+          content/
